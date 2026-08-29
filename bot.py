@@ -211,7 +211,7 @@ def load_state():
         return {"thread_id": None, "model": None, "sandbox": CODEX_SANDBOX,
                 "workspace": CODEX_CWD, "last_usage": None,
                 "session_usage": None, "context_window": None,
-                "restart_completed_chat_id": None}
+                "restart_completed_chat_id": None, "restart_message_id": None}
     try:
         data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
         thread_id = data.get("thread_id") if isinstance(data, dict) else None
@@ -226,7 +226,9 @@ def load_state():
                 "context_window": data.get("context_window")
                 if isinstance(data.get("context_window"), int) else None,
                 "restart_completed_chat_id": data.get("restart_completed_chat_id")
-                if isinstance(data.get("restart_completed_chat_id"), int) else None}
+                if isinstance(data.get("restart_completed_chat_id"), int) else None,
+                "restart_message_id": data.get("restart_message_id")
+                if isinstance(data.get("restart_message_id"), int) else None}
     except Exception as exc:
         raise SystemExit(f"codex-telegram-bot: cannot read state file {STATE_FILE}: {exc}") from exc
 
@@ -1043,8 +1045,12 @@ def restart_watcher():
             RESTART_SIGNAL_FILE.unlink()
         except FileNotFoundError:
             pass
-        update_state(restart_completed_chat_id=chat_id)
-        send_plain(chat_id, "🔄 Текущий ход завершён. Перезапускаю Codex-бота…")
+        result = send_plain(chat_id, "🔄 Текущий ход завершён. Перезапускаю Codex-бота…")
+        message_id = (result.get("result") or {}).get("message_id") if result else None
+        update_state(
+            restart_completed_chat_id=chat_id,
+            restart_message_id=message_id if isinstance(message_id, int) else None,
+        )
         time.sleep(0.5)
         os.kill(os.getpid(), signal.SIGTERM)
         return
@@ -1251,9 +1257,7 @@ def handle_message(message):
             already_busy = False
     if already_busy:
         steered, error = steer_current_turn(inputs, media_paths)
-        if steered:
-            send_plain(chat_id, "↪️ Добавил сообщение в текущий ход Codex.")
-        else:
+        if not steered:
             for path in media_paths:
                 try:
                     os.unlink(path)
@@ -1279,9 +1283,18 @@ def main():
     register_commands()
     with state_lock:
         completed_restart_chat_id = state.get("restart_completed_chat_id")
+        completed_restart_message_id = state.get("restart_message_id")
     if completed_restart_chat_id:
-        update_state(restart_completed_chat_id=None)
-        send_plain(completed_restart_chat_id, "✅ Перезагрузка окончена, бот готов к работе.")
+        update_state(restart_completed_chat_id=None, restart_message_id=None)
+        if completed_restart_message_id:
+            result = edit_plain(
+                completed_restart_chat_id, completed_restart_message_id,
+                "✅ Перезагрузка окончена, бот готов к работе.",
+            )
+            if not result.get("ok"):
+                send_plain(completed_restart_chat_id, "✅ Перезагрузка окончена, бот готов к работе.")
+        else:
+            send_plain(completed_restart_chat_id, "✅ Перезагрузка окончена, бот готов к работе.")
     try:
         get_app_server().start_if_needed()
         refresh_rate_limits()
