@@ -5,15 +5,15 @@ It uses your ChatGPT/Codex subscription through the installed Codex CLI—no
 metered OpenAI API key is required.
 
 Unlike wrappers that launch `codex exec` for every message, this bridge keeps
-one `codex app-server` alive per Telegram user. Threads survive restarts,
-events stream into one persistent Telegram progress message, and a follow-up
-can be injected into a running turn with App Server's `turn/steer`.
+one `codex app-server` alive per Telegram user. Threads survive restarts, and
+completed turns are delivered as ordinary Telegram messages with an optional
+collapsible process log.
 
 ## Features
 
-- One editable `🤔` progress message with live reasoning, tool calls and results.
 - Persistent Codex threads: `/new`, `/sessions`, `/resume`.
-- Mid-turn input: select `/steer`, then send a follow-up message.
+- Rapid consecutive messages (including forwarded batches) are combined into one prompt.
+- A message sent during an active turn is added to that same turn automatically.
 - Clean cancellation through `turn/interrupt` (`/stop`).
 - Context compaction through `thread/compact/start` (`/compact`).
 - Detailed `/usage`: session tokens, context size, subscription limits and reset times.
@@ -92,7 +92,6 @@ journalctl -u codex-telegram-bot -f
 | `/resume <id>` | Resume by full ID or unique prefix |
 | `/status` | Thread, account, model, sandbox, workspace and busy state |
 | `/stop` | Interrupt the active turn |
-| `/steer` | Pause progress while composing a mid-turn follow-up |
 | `/compact` | Compact the current thread context |
 | `/usage` | Session tokens, context and account rate limits |
 | `/model [id]` | Show available models or select one by its real ID |
@@ -102,12 +101,6 @@ journalctl -u codex-telegram-bot -f
 | `/account` | Show the current isolated Codex account |
 | `/login` | Start device-code login for an additional user |
 | `/restart` | Owner-only safe deferred restart |
-
-### Why `/steer` exists
-
-Select `/steer` from the command menu to pause progress while you compose a
-follow-up. The next ordinary message is appended to the active turn, and the
-same progress message resumes updating immediately.
 
 ## Multi-account setup
 
@@ -126,7 +119,7 @@ Each additional user gets independent:
 - `codex app-server` process;
 - sessions and usage;
 - model, sandbox and workspace;
-- active-turn, steer and stop state.
+- active-turn and stop state.
 
 Removing an ID from `whitelist.txt` blocks new messages immediately. Existing
 credentials remain on disk; remove `accounts/<id>/` separately only if you
@@ -186,10 +179,8 @@ The restart watcher sends one status message and edits that same message to
 - **Owner is unauthorized:** run `codex login status` as the service user.
 - **Additional user cannot run Codex:** use `/account`, then `/login`. Check
   that `accounts/<id>/` is writable by the service user.
-- **Need to type during a turn:** select `/steer`; progress pauses until the
-  follow-up is accepted, then resumes on the same message.
-- **No code formatting in an old draft screenshot:** current versions balance
-  and escape MarkdownV2 pre blocks. Check the journal for fresh Bot API 400s.
+- **Need to send several messages at once:** forward or type them in quick
+  succession; the bridge waits briefly and combines them into one prompt.
 - **Sandbox warning about bubblewrap:** Codex can use its bundled bubblewrap;
   installing the distribution `bubblewrap` package removes the warning.
 - **Rate limit reached:** `/usage` reports whether the five-hour or weekly

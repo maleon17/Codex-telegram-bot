@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -58,7 +59,7 @@ class RenderingTests(unittest.TestCase):
         self.assertLessEqual(len(rendered), 100)
         self.assertEqual(rendered.count("```") % 2, 0)
 
-    def test_live_progress_keeps_thought_until_next_thought(self):
+    def test_process_state_keeps_thought_until_next_thought(self):
         view = bot.TurnView(1)
         view.add_event({"type": "item.completed", "item": {
             "type": "reasoning", "id": "reason-1", "text": "Сначала проверю файл",
@@ -88,52 +89,89 @@ class RenderingTests(unittest.TestCase):
         self.assertNotIn("Сначала проверю файл", text)
         self.assertNotIn("printf two", text)
 
-    def test_live_progress_is_one_persistent_message(self):
+    def test_progress_is_not_sent_as_a_transient_draft(self):
         calls = []
         original_tg_call = bot.tg_call
 
         def fake_tg_call(method, params=None, timeout=bot.HTTP_TIMEOUT_S):
             calls.append((method, params or {}))
-            if method == "sendMessage":
-                return {"ok": True, "result": {"message_id": 42}}
-            return {"ok": True, "result": {}}
+            return {"ok": True, "result": {"message_id": 42}}
 
         bot.tg_call = fake_tg_call
         try:
             view = bot.TurnView(1)
             view.flush(force=True)
-            view.draft_thought = "Мысль"
-            view.flush(force=True)
         finally:
             bot.tg_call = original_tg_call
 
-        self.assertEqual([method for method, _ in calls], ["sendMessage", "editMessageText"])
-        self.assertNotIn("sendMessageDraft", [method for method, _ in calls])
-        self.assertIn("🤔", calls[0][1]["text"])
-        self.assertIn("Мысль", calls[1][1]["text"])
+        self.assertEqual(calls, [])
 
-    def test_steer_resume_unpauses_the_same_progress_message(self):
-        calls = []
-        original_tg_call = bot.tg_call
+    def test_batch_inputs_preserve_order_and_separate_messages(self):
+        inputs, paths = bot.combine_input_batch([
+            ([{"type": "text", "text": "первое"}], ["/tmp/one.jpg"]),
+            ([{"type": "text", "text": "второе"},
+              {"type": "localImage", "path": "/tmp/two.jpg"}], ["/tmp/two.jpg"]),
+        ])
+        self.assertEqual(paths, ["/tmp/one.jpg", "/tmp/two.jpg"])
+        self.assertEqual(
+            inputs,
+            [
+                {"type": "text", "text": "первое"},
+                {"type": "text", "text": "\n\n---\n\n"},
+                {"type": "text", "text": "второе"},
+                {"type": "localImage", "path": "/tmp/two.jpg"},
+            ],
+        )
 
-        def fake_tg_call(method, params=None, timeout=bot.HTTP_TIMEOUT_S):
-            calls.append((method, params or {}))
-            if method == "sendMessage":
-                return {"ok": True, "result": {"message_id": 43}}
-            return {"ok": True, "result": {}}
+    def test_steer_is_internal_only(self):
+        self.assertNotIn("steer", [command for command, _ in bot.COMMANDS])
 
-        bot.tg_call = fake_tg_call
-        try:
-            view = bot.TurnView(1)
-            view.draft_paused = True
-            view.flush(force=True)
-            self.assertEqual(calls, [])
-            view.resume()
-        finally:
-            bot.tg_call = original_tg_call
+    def test_queue_message_debounces_until_one_turn(self):
+        timers = []
+        started = []
 
-        self.assertEqual([method for method, _ in calls], ["sendMessage"])
-        self.assertFalse(view.draft_paused)
+        class FakeTimer:
+            def __init__(self, interval, function):
+                self.interval = interval
+                self.function = function
+                self.cancelled = False
+                timers.append(self)
+
+            def start(self):
+                started.append(self)
+
+            def cancel(self):
+                self.cancelled = True
+
+        class FakeThread:
+            def __init__(self, target, args=(), daemon=None):
+                self.target = target
+                self.args = args
+
+            def start(self):
+                self.target(*self.args)
+
+        launched = []
+        runtime = bot.TenantRuntime(1)
+        with patch.object(bot.threading, "Timer", FakeTimer), \
+                patch.object(bot.threading, "Thread", FakeThread), \
+                patch.object(bot, "run_turn", lambda *args: launched.append(args)):
+            bot.queue_message(runtime, [{"type": "text", "text": "раз"}], [])
+            bot.queue_message(runtime, [{"type": "text", "text": "два"}], [])
+            self.assertEqual(len(runtime.pending_batch), 2)
+            self.assertTrue(timers[0].cancelled)
+            timers[-1].function()
+
+        self.assertEqual(len(launched), 1)
+        self.assertEqual(
+            launched[0][1],
+            [
+                {"type": "text", "text": "раз"},
+                {"type": "text", "text": "\n\n---\n\n"},
+                {"type": "text", "text": "два"},
+            ],
+        )
+        self.assertFalse(runtime.pending_batch)
 
     def test_empty_reasoning_is_not_rendered_as_a_blank_step(self):
         self.assertEqual(bot.render_process_item({"type": "reasoning", "summary": []}), "")

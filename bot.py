@@ -14,10 +14,10 @@ from datetime import datetime
 from pathlib import Path
 
 from app_server import AppServerClient, AppServerError
-from telegram_format import escape_mdv2, strip_mdv2
+from telegram_format import escape_mdv2
 
 
-EDIT_THROTTLE_S = 1.3
+BATCH_DEBOUNCE_S = 1.5
 MAX_MESSAGE_LEN = 4000
 RICH_MAX_CHARS = 30000
 HTTP_TIMEOUT_S = 20
@@ -29,7 +29,6 @@ COMMANDS = [
     ("resume", "Продолжить сессию по id"),
     ("status", "Сессия, модель, sandbox и workspace"),
     ("stop", "Прервать текущий запрос"),
-    ("steer", "Освободить ввод и дополнить текущий ход"),
     ("usage", "Токены последнего запроса"),
     ("compact", "Сжать контекст текущей сессии"),
     ("model", "Выбрать модель Codex"),
@@ -99,6 +98,11 @@ class TenantRuntime:
         self.active_media_paths = []
         self.last_rate_limits = None
         self.login_id = None
+        # Rapid Telegram updates (most visibly a multi-message forward) are
+        # held briefly and dispatched as one prompt instead of starting one
+        # Codex turn per update.
+        self.pending_batch = []
+        self.batch_timer = None
 
 
 tenants = {}
@@ -429,7 +433,7 @@ def item_label_and_blocks(item):
         return "🔧 Bash", compact(command, 1400), results
     if item_type == "file_change":
         # App Server includes the complete patch in changes[*].kind.diff.  A
-        # draft is progress UI, not a debug console: exposing that payload can
+        # Progress is a user-facing summary, not a debug console: exposing that payload can
         # fill the whole chat with escaped JSON and partially rendered code.
         changes = item.get("changes") or []
         if not isinstance(changes, list):
@@ -651,20 +655,12 @@ class TurnView:
         self.chat_id = chat_id
         self.items = []
         self.process_items = []
-        self.draft_thought = None
-        self.draft_thought_id = None
-        self.draft_tool = None
-        self.last_edit_at = 0.0
+        self.current_thought = None
+        self.current_thought_id = None
+        self.current_tool = None
         self.usage = None
         self.completed = False
         self.context_notice = None
-        self.draft_paused = False
-        # Live progress is a real Telegram message, edited in place.  This
-        # mirrors the Claude bridge and avoids native drafts disappearing or
-        # occupying the composer after /steer.
-        self.progress_msg_id = None
-        self.progress_attempted = False
-        self.progress_lock = threading.Lock()
 
     @staticmethod
     def _thought_id(item):
@@ -674,11 +670,11 @@ class TurnView:
         text = protocol_text(item.get("text", item.get("summary", "")))
         if not text.strip():
             return False
-        self.draft_thought = text
-        self.draft_thought_id = self._thought_id(item)
+        self.current_thought = text
+        self.current_thought_id = self._thought_id(item)
         # A new thought starts the next model phase.  Until this point the
         # previous thought remains visible while a following tool runs.
-        self.draft_tool = None
+        self.current_tool = None
         return True
 
     def add_thought_delta(self, delta, item_id=None):
@@ -688,15 +684,15 @@ class TurnView:
         # App Server normally supplies itemId.  If an older server omits it,
         # the presence of a tool is enough to identify this as the next
         # thought phase.  Subsequent deltas then append to the same thought.
-        if item_id and item_id != self.draft_thought_id:
-            self.draft_thought = ""
-            self.draft_tool = None
-            self.draft_thought_id = item_id
-        elif self.draft_tool is not None:
-            self.draft_thought = ""
-            self.draft_tool = None
-            self.draft_thought_id = item_id
-        self.draft_thought = (self.draft_thought or "") + delta
+        if item_id and item_id != self.current_thought_id:
+            self.current_thought = ""
+            self.current_tool = None
+            self.current_thought_id = item_id
+        elif self.current_tool is not None:
+            self.current_thought = ""
+            self.current_tool = None
+            self.current_thought_id = item_id
+        self.current_thought = (self.current_thought or "") + delta
 
     def add_event(self, event):
         event_type = event.get("type", "unknown")
@@ -713,7 +709,7 @@ class TurnView:
                 if item_type in ("agent_message", "reasoning"):
                     self._set_thought(item)
                 else:
-                    self.draft_tool = item
+                    self.current_tool = item
         elif event_type == "item.completed":
             item = event.get("item")
             if isinstance(item, dict):
@@ -722,7 +718,7 @@ class TurnView:
                 if item_type in ("agent_message", "reasoning"):
                     self._set_thought(item)
                 else:
-                    self.draft_tool = item
+                    self.current_tool = item
                 self.process_items.append(item)
         elif event_type == "turn.completed":
             self.completed = True
@@ -732,10 +728,10 @@ class TurnView:
 
     def live_text(self):
         lines = []
-        if self.draft_thought:
-            lines.append(escape_mdv2(self.draft_thought))
-        if self.draft_tool:
-            label, content, results = item_label_and_blocks(self.draft_tool)
+        if self.current_thought:
+            lines.append(escape_mdv2(self.current_thought))
+        if self.current_tool:
+            label, content, results = item_label_and_blocks(self.current_tool)
             lines.append(escape_mdv2(f"{label}:"))
             if content:
                 lines.append(mdv2_code_block(content))
@@ -745,71 +741,14 @@ class TurnView:
         body = "\n".join(lines) if lines else "Думаю"
         return f"🤔 {body}"
 
-    def _send_or_edit_live(self, text, force=False):
-        with self.progress_lock:
-            now = time.monotonic()
-            if (
-                self.progress_msg_id is not None
-                and not force
-                and now - self.last_edit_at < EDIT_THROTTLE_S
-            ):
-                return
-            if self.progress_msg_id is None:
-                if self.progress_attempted:
-                    return
-                self.progress_attempted = True
-                result = tg_call("sendMessage", {
-                    "chat_id": self.chat_id,
-                    "text": text,
-                    "parse_mode": "MarkdownV2",
-                })
-                if not result.get("ok") and not _rate_limited(result):
-                    result = tg_call("sendMessage", {
-                        "chat_id": self.chat_id,
-                        "text": strip_mdv2(text).replace("```", ""),
-                    })
-                if result.get("ok"):
-                    self.progress_msg_id = (result.get("result") or {}).get("message_id")
-            else:
-                params = {
-                    "chat_id": self.chat_id,
-                    "message_id": self.progress_msg_id,
-                    "text": text,
-                    "parse_mode": "MarkdownV2",
-                }
-                result = tg_call("editMessageText", params)
-                if not result.get("ok"):
-                    description = str(result.get("description", "")).lower()
-                    if "not modified" not in description and not _rate_limited(result):
-                        params["text"] = strip_mdv2(text).replace("```", "")
-                        params.pop("parse_mode", None)
-                        tg_call("editMessageText", params)
-            self.last_edit_at = now
-
     def flush(self, force=False):
-        if self.draft_paused:
-            return
-        now = time.monotonic()
-        if not force and now - self.last_edit_at < EDIT_THROTTLE_S:
-            return
-        try:
-            self._send_or_edit_live(truncate_mdv2(self.live_text()), force=force)
-        except Exception as exc:
-            # A Telegram hiccup must never stop App Server event consumption.
-            log(f"Live progress update failed: {exc}")
+        """Collect events without publishing transient Telegram progress.
 
-    def resume(self):
-        """Resume live updates after the follow-up message used by /steer."""
-        self.draft_paused = False
-        self.flush(force=True)
-
-    def replace_progress(self, text):
-        """Replace the live message in place, returning whether it succeeded."""
-        with self.progress_lock:
-            if self.progress_msg_id is None:
-                return False
-            result = edit_rich(self.chat_id, self.progress_msg_id, text)
-            return bool(result and result.get("ok"))
+        The complete process log is sent once the turn finishes, just like
+        the Claude bridge's final delivery.  Keeping this method as a no-op
+        lets notification handling consume live App Server events uniformly.
+        """
+        return None
 
     def deliver(self, stopped=False, error=None):
         final_index = next(
@@ -863,12 +802,8 @@ class TurnView:
                 visible.insert(0, f"…и ещё {hidden} шагов выше…")
             body = "\n".join(visible)
             rich = f"<details><summary>🔧 Процесс ({len(process_steps)})</summary>\n{body}\n</details>"
-            if not self.replace_progress(rich):
-                send_rich(self.chat_id, rich)
+            send_rich(self.chat_id, rich)
             send_rich(self.chat_id, answer)
-        elif self.progress_msg_id is not None:
-            if not self.replace_progress(answer):
-                send_rich(self.chat_id, answer)
         else:
             send_rich(self.chat_id, answer)
 
@@ -1226,8 +1161,6 @@ def run_compaction(runtime, thread_id):
             runtime.active_error = None
             runtime.active_stopped = False
             runtime.active_last_event_at = time.monotonic()
-        view.draft_thought = "🗜 Сжимаю контекст сессии…"
-        view.flush(force=True)
         client.request("thread/compact/start", {"threadId": server_thread_id}, timeout=60)
         if not done.wait(TOTAL_TIMEOUT_S):
             error = "Сжатие контекста не завершилось за отведённое время."
@@ -1235,17 +1168,14 @@ def run_compaction(runtime, thread_id):
             error = error or runtime.active_error
         if error:
             message = f"🗜 Не удалось сжать контекст: {error}"
-            if not view.replace_progress(message):
-                send_plain(chat_id, message)
+            send_plain(chat_id, message)
         else:
             update_state(chat_id, last_usage=None, session_usage=None, context_window=None)
             message = "🗜 Контекст сессии сжат. Можно продолжать."
-            if not view.replace_progress(message):
-                send_plain(chat_id, message)
+            send_plain(chat_id, message)
     except Exception as exc:
         message = f"🗜 Не удалось сжать контекст: {user_facing_codex_error(exc)}"
-        if not view.replace_progress(message):
-            send_plain(chat_id, message)
+        send_plain(chat_id, message)
     finally:
         with process_lock:
             runtime.active_view = None
@@ -1456,7 +1386,7 @@ def restart_watcher():
         if not RESTART_SIGNAL_FILE.exists():
             continue
         with process_lock:
-            if any(runtime.busy for runtime in tenants.values()):
+            if any(runtime.busy or runtime.pending_batch for runtime in tenants.values()):
                 continue
             restart_draining = True
         try:
@@ -1520,13 +1450,104 @@ def steer_current_turn(runtime, inputs, media_paths=None):
         return False, compact(str(exc), 500)
 
 
-def pause_active_draft(runtime):
+def cleanup_media_paths(paths):
+    for path in paths or []:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+
+
+def combine_input_batch(entries):
+    """Combine rapid Telegram messages into one ordered App Server input.
+
+    Text messages are separated visibly for the model.  Images and other
+    local inputs stay in their original order, so a forwarded caption/image
+    pair remains associated with the message that supplied it.
+    """
+    combined = []
+    media_paths = []
+    for index, (inputs, paths) in enumerate(entries):
+        if index:
+            combined.append({"type": "text", "text": "\n\n---\n\n"})
+        combined.extend(inputs or [])
+        media_paths.extend(paths or [])
+    return combined, media_paths
+
+
+def cancel_pending_batch(runtime):
+    """Cancel an idle debounce batch and remove any downloaded media."""
     with process_lock:
-        view = runtime.active_view
-        if not runtime.busy or view is None:
-            return False
-        view.draft_paused = True
-        return True
+        timer = runtime.batch_timer
+        runtime.batch_timer = None
+        entries = runtime.pending_batch
+        runtime.pending_batch = []
+    if timer is not None:
+        timer.cancel()
+    cleanup_media_paths(
+        path for _, paths in entries for path in (paths or [])
+    )
+
+
+def flush_pending_batch(runtime, timer):
+    """Start the one turn represented by the current debounce window."""
+    with process_lock:
+        # A canceled timer can still wake up concurrently.  Only the newest
+        # timer that is still registered for this chat may consume the batch.
+        if runtime.batch_timer is not timer:
+            return
+        runtime.batch_timer = None
+        entries = runtime.pending_batch
+        runtime.pending_batch = []
+        if not entries:
+            return
+        already_busy = runtime.busy
+        if not already_busy:
+            runtime.busy = True
+
+    inputs, media_paths = combine_input_batch(entries)
+    if already_busy:
+        steered, error = steer_current_turn(runtime, inputs, media_paths)
+        if not steered:
+            cleanup_media_paths(media_paths)
+            send_plain(runtime.chat_id, f"Не получилось добавить сообщения в текущий ход: {error}")
+        return
+
+    with state_lock:
+        thread_id = chat_state(runtime.chat_id).get("thread_id")
+    threading.Thread(
+        target=run_turn,
+        args=(runtime, inputs, thread_id, media_paths),
+        daemon=True,
+    ).start()
+
+
+def queue_message(runtime, inputs, media_paths=None):
+    """Debounce idle messages; inject directly when a turn is already live."""
+    with process_lock:
+        if runtime.busy:
+            already_busy = True
+            timer = None
+        else:
+            already_busy = False
+            runtime.pending_batch.append((inputs, media_paths or []))
+            old_timer = runtime.batch_timer
+
+            def fire():
+                flush_pending_batch(runtime, timer)
+
+            timer = threading.Timer(BATCH_DEBOUNCE_S, fire)
+            timer.daemon = True
+            runtime.batch_timer = timer
+    if already_busy:
+        steered, error = steer_current_turn(runtime, inputs, media_paths)
+        if not steered:
+            cleanup_media_paths(media_paths)
+            send_plain(runtime.chat_id, f"Не получилось добавить сообщение в текущий ход: {error}")
+        return
+    if old_timer is not None:
+        old_timer.cancel()
+    timer.start()
 
 
 def start_account_login(runtime):
@@ -1589,6 +1610,9 @@ def handle_command(chat_id, command):
     raw_cmd, _, arg = command.partition(" ")
     cmd = raw_cmd.split("@", 1)[0].lower().lstrip("/.")
     arg = arg.strip()
+    if cmd in {"new", "resume", "compact", "model", "effort", "mode",
+               "workspace", "restart", "stop"}:
+        cancel_pending_batch(runtime)
     if cmd in ("start", "help"):
         send_plain(chat_id, "Codex Telegram bridge. Команды доступны в меню бота.")
         return True
@@ -1634,7 +1658,7 @@ def handle_command(chat_id, command):
                    f"Мощность: {snapshot.get('effort') or 'не определена'}\n"
                    f"Sandbox: {snapshot.get('sandbox')}\n"
                    f"Workspace: {snapshot.get('workspace')}\n"
-                   f"Занят: {'да' if runtime.busy else 'нет'}\n"
+                   f"Занят: {'да' if (runtime.busy or runtime.pending_batch) else 'нет'}\n"
                    f"Аккаунт: {snapshot.get('account_status') or 'не подключён'}")
         return True
     if cmd == "usage":
@@ -1658,15 +1682,6 @@ def handle_command(chat_id, command):
             threading.Thread(
                 target=run_compaction, args=(runtime, thread_id), daemon=True
             ).start()
-        return True
-    if cmd == "steer":
-        if pause_active_draft(runtime):
-            # Keep the progress message frozen while the owner composes the
-            # follow-up; handle_message() resumes it after turn/steer accepts
-            # that message.
-            send_plain(chat_id, "✍️ Прогресс приостановлен. Пиши дополнение — оно войдёт в текущий ход.")
-        else:
-            send_plain(chat_id, "Сейчас нет активного хода; просто отправь обычное сообщение.")
         return True
     if cmd == "model":
         try:
@@ -1740,7 +1755,7 @@ def handle_command(chat_id, command):
             send_plain(chat_id, "Перезапуск доступен только владельцу бота.")
             return True
         request_restart(chat_id)
-        if runtime.busy:
+        if runtime.busy or runtime.pending_batch:
             send_plain(chat_id, "🔁 Перезапуск запланирован после завершения текущего хода.")
         else:
             send_plain(chat_id, "🔁 Перезапуск запланирован между ходами.")
@@ -1793,36 +1808,7 @@ def handle_message(message):
     except Exception as exc:
         send_plain(chat_id, f"Не смог скачать изображение: {compact(str(exc), 500)}")
         return
-    with process_lock:
-        if runtime.busy:
-            already_busy = True
-        else:
-            runtime.busy = True
-            already_busy = False
-    if already_busy:
-        steered, error = steer_current_turn(runtime, inputs, media_paths)
-        if steered:
-            # /steer temporarily pauses the live progress message so the
-            # owner can type.  Once the follow-up is accepted, immediately
-            # resume editing the same message instead of leaving the draft
-            # permanently frozen for the rest of the turn.
-            with process_lock:
-                view = runtime.active_view
-            if view is not None:
-                view.resume()
-        else:
-            for path in media_paths:
-                try:
-                    os.unlink(path)
-                except FileNotFoundError:
-                    pass
-            send_plain(chat_id, f"Не получилось добавить в текущий ход: {error}")
-        return
-    with state_lock:
-        thread_id = chat_state(chat_id).get("thread_id")
-    threading.Thread(
-        target=run_turn, args=(runtime, inputs, thread_id, media_paths), daemon=True
-    ).start()
+    queue_message(runtime, inputs, media_paths)
 
 
 def register_commands():
