@@ -11,10 +11,11 @@ class AppServerError(RuntimeError):
 
 
 class AppServerClient:
-    def __init__(self, notification_handler, log, request_timeout=30):
+    def __init__(self, notification_handler, log, request_timeout=30, env=None):
         self.notification_handler = notification_handler
         self.log = log
         self.request_timeout = request_timeout
+        self.env = env
         self.process = None
         self._write_lock = threading.Lock()
         self._state_lock = threading.Lock()
@@ -34,6 +35,7 @@ class AppServerClient:
                 stderr=subprocess.PIPE,
                 text=True,
                 bufsize=1,
+                env=self.env,
             )
             threading.Thread(target=self._read_stdout, daemon=True).start()
             threading.Thread(target=self._read_stderr, daemon=True).start()

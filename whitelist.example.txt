@@ -1,0 +1,2 @@
+# One numeric Telegram user ID per line (owner is always allowed).
+# 123456789

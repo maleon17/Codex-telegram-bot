@@ -36,6 +36,8 @@ COMMANDS = [
     ("model", "Выбрать модель Codex"),
     ("mode", "Sandbox: read-only/workspace-write/full"),
     ("workspace", "Рабочая директория"),
+    ("account", "Состояние аккаунта Codex"),
+    ("login", "Подключить свой аккаунт Codex"),
     ("restart", "Перезапустить Codex-бота"),
 ]
 
@@ -66,25 +68,70 @@ RESTART_SIGNAL_FILE = Path(os.environ.get(
     "CODEX_BOT_RESTART_FILE", Path(__file__).with_name("restart.request")
 )).expanduser()
 API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
+WHITELIST_FILE = Path(os.environ.get(
+    "CODEX_BOT_WHITELIST_FILE", Path(__file__).with_name("whitelist.txt")
+)).expanduser()
+ACCOUNTS_DIR = Path(os.environ.get(
+    "CODEX_BOT_ACCOUNTS_DIR", Path(__file__).with_name("accounts")
+)).expanduser()
 
-state_lock = threading.Lock()
+state_lock = threading.RLock()
 process_lock = threading.RLock()
 telegram_lock = threading.Lock()
 rate_limit_until = 0.0
-busy = False
-app_server = None
-loaded_thread_id = None
-loaded_server_pid = None
-active_view = None
-active_done = None
-active_turn_id = None
-active_thread_id = None
-active_error = None
-active_stopped = False
-active_last_event_at = None
-active_media_paths = []
 restart_draining = False
-last_rate_limits = None
+
+
+class TenantRuntime:
+    def __init__(self, chat_id):
+        self.chat_id = int(chat_id)
+        self.busy = False
+        self.app_server = None
+        self.loaded_thread_id = None
+        self.loaded_server_pid = None
+        self.active_view = None
+        self.active_done = None
+        self.active_turn_id = None
+        self.active_thread_id = None
+        self.active_error = None
+        self.active_stopped = False
+        self.active_last_event_at = None
+        self.active_media_paths = []
+        self.last_rate_limits = None
+        self.login_id = None
+
+
+tenants = {}
+
+
+def get_tenant(chat_id):
+    chat_id = int(chat_id)
+    with process_lock:
+        runtime = tenants.get(chat_id)
+        if runtime is None:
+            runtime = TenantRuntime(chat_id)
+            tenants[chat_id] = runtime
+        return runtime
+
+
+def load_whitelist():
+    result = {str(OWNER_ID)}
+    try:
+        raw = WHITELIST_FILE.read_text(encoding="utf-8")
+        result.update(part.strip() for part in raw.replace("\n", ",").split(",") if part.strip())
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        log(f"Could not read whitelist: {exc}")
+    return result
+
+
+def tenant_codex_home(chat_id):
+    if int(chat_id) == OWNER_ID:
+        return None
+    path = ACCOUNTS_DIR / str(chat_id)
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return path
 
 
 def _rate_limited(result):
@@ -208,56 +255,72 @@ def message_inputs(message):
 
 def load_state():
     if not STATE_FILE.exists():
-        return {"thread_id": None, "model": None, "sandbox": CODEX_SANDBOX,
-                "workspace": CODEX_CWD, "last_usage": None,
-                "session_usage": None, "context_window": None,
-                "restart_completed_chat_id": None, "restart_message_id": None}
+        return {"version": 2, "chats": {}, "runtime": {}}
     try:
         data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        thread_id = data.get("thread_id") if isinstance(data, dict) else None
-        return {"thread_id": thread_id if isinstance(thread_id, str) else None,
-                "model": data.get("model") if isinstance(data.get("model"), str) else None,
-                "sandbox": data.get("sandbox") if data.get("sandbox") in
-                ("read-only", "workspace-write", "danger-full-access") else CODEX_SANDBOX,
-                "workspace": data.get("workspace") if isinstance(data.get("workspace"), str) else CODEX_CWD,
-                "last_usage": data.get("last_usage") if isinstance(data.get("last_usage"), dict) else None,
-                "session_usage": data.get("session_usage")
-                if isinstance(data.get("session_usage"), dict) else None,
-                "context_window": data.get("context_window")
-                if isinstance(data.get("context_window"), int) else None,
-                "restart_completed_chat_id": data.get("restart_completed_chat_id")
-                if isinstance(data.get("restart_completed_chat_id"), int) else None,
-                "restart_message_id": data.get("restart_message_id")
-                if isinstance(data.get("restart_message_id"), int) else None}
+        if not isinstance(data, dict):
+            raise ValueError("state root is not an object")
+        if data.get("version") == 2 and isinstance(data.get("chats"), dict):
+            data.setdefault("runtime", {})
+            return data
+        # One-time, lossless migration: the old global state belonged to the
+        # owner. Additional users start with clean isolated entries.
+        runtime_keys = ("restart_completed_chat_id", "restart_message_id")
+        runtime = {key: data.pop(key) for key in runtime_keys if key in data}
+        return {"version": 2, "chats": {str(OWNER_ID): data}, "runtime": runtime}
     except Exception as exc:
         raise SystemExit(f"codex-telegram-bot: cannot read state file {STATE_FILE}: {exc}") from exc
 
 
-state = load_state()
+state_db = load_state()
 
 
-def update_state(**values):
+def chat_state(chat_id):
     with state_lock:
-        state.update(values)
-        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        fd, temporary = tempfile.mkstemp(prefix=STATE_FILE.name + ".", dir=STATE_FILE.parent)
+        entry = state_db["chats"].setdefault(str(chat_id), {})
+        entry.setdefault("thread_id", None)
+        entry.setdefault("model", None)
+        entry.setdefault("sandbox", CODEX_SANDBOX)
+        entry.setdefault("workspace", CODEX_CWD)
+        entry.setdefault("last_usage", None)
+        entry.setdefault("session_usage", None)
+        entry.setdefault("context_window", None)
+        entry.setdefault("account_status", "ready" if int(chat_id) == OWNER_ID else None)
+        return entry
+
+
+def update_state(chat_id=OWNER_ID, **values):
+    with state_lock:
+        state_db["chats"].setdefault(str(chat_id), {}).update(values)
+        _save_state_locked()
+
+
+def update_runtime_state(**values):
+    with state_lock:
+        state_db.setdefault("runtime", {}).update(values)
+        _save_state_locked()
+
+
+def _save_state_locked():
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=STATE_FILE.name + ".", dir=STATE_FILE.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(state_db, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, STATE_FILE)
+    except Exception:
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(state, handle, ensure_ascii=False, indent=2)
-                handle.write("\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, STATE_FILE)
-        except Exception:
-            try:
-                os.unlink(temporary)
-            except FileNotFoundError:
-                pass
-            raise
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
 
 
-def save_thread_id(thread_id):
-    update_state(thread_id=thread_id)
+def save_thread_id(chat_id, thread_id):
+    update_state(chat_id, thread_id=thread_id)
 
 
 def compact(value, limit=1000):
@@ -355,9 +418,9 @@ def user_facing_codex_error(error):
     return compact(text, 1000)
 
 
-def usage_limit_exceeded_message():
+def usage_limit_exceeded_message(runtime=None):
     with process_lock:
-        limits = dict(last_rate_limits or {})
+        limits = dict((runtime.last_rate_limits if runtime else None) or {})
     windows = [
         ("5-часовой лимит", limits.get("primary")),
         ("недельный лимит", limits.get("secondary")),
@@ -458,7 +521,7 @@ class TurnView:
         if event_type == "thread.started":
             thread_id = event.get("thread_id")
             if thread_id:
-                save_thread_id(thread_id)
+                save_thread_id(self.chat_id, thread_id)
         elif event_type == "turn.started":
             pass
         elif event_type in ("item.started", "item.updated"):
@@ -485,7 +548,7 @@ class TurnView:
             self.completed = True
             self.usage = event.get("usage")
             if isinstance(self.usage, dict):
-                update_state(last_usage=self.usage)
+                update_state(self.chat_id, last_usage=self.usage)
 
     def live_text(self):
         lines = []
@@ -569,12 +632,20 @@ class TurnView:
             send_rich(self.chat_id, answer)
 
 
-def get_app_server():
-    global app_server
+def get_app_server(runtime):
     with process_lock:
-        if app_server is None:
-            app_server = AppServerClient(handle_app_notification, log)
-        return app_server
+        if runtime.app_server is None:
+            env = None
+            codex_home = tenant_codex_home(runtime.chat_id)
+            if codex_home is not None:
+                env = dict(os.environ)
+                env["CODEX_HOME"] = str(codex_home)
+            runtime.app_server = AppServerClient(
+                lambda method, params: handle_app_notification(runtime, method, params),
+                lambda message: log(f"tenant={runtime.chat_id} {message}"),
+                env=env,
+            )
+        return runtime.app_server
 
 
 def _usage_breakdown(usage):
@@ -592,31 +663,37 @@ def _usage_for_renderer(token_usage):
     return _usage_breakdown((token_usage or {}).get("last") or {})
 
 
-def handle_app_notification(method, params):
-    global active_turn_id, active_thread_id, active_error, active_last_event_at
-    global last_rate_limits
+def handle_app_notification(runtime, method, params):
     if method == "account/rateLimits/updated":
         update = params.get("rateLimits") or {}
         with process_lock:
-            merged = dict(last_rate_limits or {})
+            merged = dict(runtime.last_rate_limits or {})
             for key, value in update.items():
                 if value is not None:
                     merged[key] = value
-            last_rate_limits = merged
+            runtime.last_rate_limits = merged
+        return
+    if method == "account/login/completed":
+        success = bool(params.get("success"))
+        update_state(runtime.chat_id, account_status="ready" if success else "login_failed")
+        if success:
+            send_plain(runtime.chat_id, "✅ Вход в аккаунт Codex завершён.")
+        else:
+            send_plain(runtime.chat_id, f"❌ Вход не завершён: {params.get('error') or 'неизвестная ошибка'}")
         return
     with process_lock:
-        view = active_view
-        done = active_done
+        view = runtime.active_view
+        done = runtime.active_done
         if view is None:
             return
         event_turn_id = params.get("turnId") or (params.get("turn") or {}).get("id")
-        if active_turn_id and event_turn_id and event_turn_id != active_turn_id:
+        if runtime.active_turn_id and event_turn_id and event_turn_id != runtime.active_turn_id:
             return
-        active_last_event_at = time.monotonic()
+        runtime.active_last_event_at = time.monotonic()
         if event_turn_id:
-            active_turn_id = event_turn_id
+            runtime.active_turn_id = event_turn_id
         if params.get("threadId"):
-            active_thread_id = params["threadId"]
+            runtime.active_thread_id = params["threadId"]
 
     force = False
     if method in ("item/started", "item/completed"):
@@ -646,13 +723,18 @@ def handle_app_notification(method, params):
                     f"⚠️ Контекст заполнен на {ratio:.0%}; скоро понадобится /compact."
                 )
         update_state(
+            runtime.chat_id,
             last_usage=view.usage,
             session_usage=_usage_breakdown(token_usage.get("total") or {}),
             context_window=token_usage.get("modelContextWindow"),
         )
     elif method == "error" and not params.get("willRetry"):
         with process_lock:
-            active_error = user_facing_codex_error(params.get("error", "неизвестная ошибка"))
+            error = params.get("error", "неизвестная ошибка")
+            if isinstance(error, dict) and error.get("codexErrorInfo") == "usageLimitExceeded":
+                runtime.active_error = usage_limit_exceeded_message(runtime)
+            else:
+                runtime.active_error = user_facing_codex_error(error)
     elif method == "thread/compacted":
         view.context_notice = "🗜 Контекст сессии сжат."
         force = True
@@ -662,7 +744,12 @@ def handle_app_notification(method, params):
         turn = params.get("turn") or {}
         if turn.get("error"):
             with process_lock:
-                active_error = user_facing_codex_error(turn["error"])
+                turn_error = turn["error"]
+                if (isinstance(turn_error, dict)
+                        and turn_error.get("codexErrorInfo") == "usageLimitExceeded"):
+                    runtime.active_error = usage_limit_exceeded_message(runtime)
+                else:
+                    runtime.active_error = user_facing_codex_error(turn_error)
         view.completed = True
         force = True
         if done is not None:
@@ -670,9 +757,9 @@ def handle_app_notification(method, params):
     view.flush(force=force)
 
 
-def _thread_params(thread_id=None):
+def _thread_params(runtime, thread_id=None):
     with state_lock:
-        snapshot = dict(state)
+        snapshot = dict(chat_state(runtime.chat_id))
     params = {
         "cwd": snapshot.get("workspace") or CODEX_CWD,
         "sandbox": snapshot.get("sandbox") or CODEX_SANDBOX,
@@ -685,28 +772,27 @@ def _thread_params(thread_id=None):
     return params
 
 
-def ensure_thread(client, requested_thread_id):
-    global loaded_thread_id, loaded_server_pid
+def ensure_thread(runtime, client, requested_thread_id):
     process_pid = client.process.pid if client.process is not None else None
     with process_lock:
-        if (requested_thread_id and requested_thread_id == loaded_thread_id
-                and process_pid == loaded_server_pid):
+        if (requested_thread_id and requested_thread_id == runtime.loaded_thread_id
+                and process_pid == runtime.loaded_server_pid):
             return requested_thread_id
     method = "thread/resume" if requested_thread_id else "thread/start"
     try:
-        result = client.request(method, _thread_params(requested_thread_id), timeout=60)
+        result = client.request(method, _thread_params(runtime, requested_thread_id), timeout=60)
     except AppServerError:
         if not requested_thread_id:
             raise
         log(f"Could not resume thread {requested_thread_id}; starting a new thread")
-        result = client.request("thread/start", _thread_params(), timeout=60)
+        result = client.request("thread/start", _thread_params(runtime), timeout=60)
     thread_id = ((result or {}).get("thread") or {}).get("id")
     if not thread_id:
         raise AppServerError(f"{method} returned no thread id")
     with process_lock:
-        loaded_thread_id = thread_id
-        loaded_server_pid = process_pid
-    save_thread_id(thread_id)
+        runtime.loaded_thread_id = thread_id
+        runtime.loaded_server_pid = process_pid
+    save_thread_id(runtime.chat_id, thread_id)
     return thread_id
 
 
@@ -719,28 +805,27 @@ def sandbox_policy(name, workspace):
     return {"type": "dangerFullAccess"}
 
 
-def run_turn(chat_id, inputs, thread_id, media_paths=None):
-    global busy, active_view, active_done, active_turn_id, active_thread_id
-    global active_error, active_stopped, active_last_event_at, active_media_paths
+def run_turn(runtime, inputs, thread_id, media_paths=None):
+    chat_id = runtime.chat_id
     view = TurnView(chat_id)
     done = threading.Event()
     error = None
     stopped = False
     try:
-        client = get_app_server()
+        client = get_app_server(runtime)
         client.start_if_needed()
-        server_thread_id = ensure_thread(client, thread_id)
+        server_thread_id = ensure_thread(runtime, client, thread_id)
         with state_lock:
-            snapshot = dict(state)
+            snapshot = dict(chat_state(chat_id))
         with process_lock:
-            active_view = view
-            active_done = done
-            active_turn_id = None
-            active_thread_id = server_thread_id
-            active_error = None
-            active_stopped = False
-            active_last_event_at = time.monotonic()
-            active_media_paths = list(media_paths or [])
+            runtime.active_view = view
+            runtime.active_done = done
+            runtime.active_turn_id = None
+            runtime.active_thread_id = server_thread_id
+            runtime.active_error = None
+            runtime.active_stopped = False
+            runtime.active_last_event_at = time.monotonic()
+            runtime.active_media_paths = list(media_paths or [])
         view.flush(force=True)
         params = {
             "threadId": server_thread_id,
@@ -757,11 +842,11 @@ def run_turn(chat_id, inputs, thread_id, media_paths=None):
         result = client.request("turn/start", params, timeout=60)
         turn_id = ((result or {}).get("turn") or {}).get("id")
         with process_lock:
-            active_turn_id = active_turn_id or turn_id
+            runtime.active_turn_id = runtime.active_turn_id or turn_id
         started_at = time.monotonic()
         while not done.wait(1):
             with process_lock:
-                last_event = active_last_event_at or started_at
+                last_event = runtime.active_last_event_at or started_at
                 process = client.process
             now = time.monotonic()
             if process is None or process.poll() is not None:
@@ -769,27 +854,27 @@ def run_turn(chat_id, inputs, thread_id, media_paths=None):
                 break
             if now - last_event > IDLE_TIMEOUT_S or now - started_at > TOTAL_TIMEOUT_S:
                 error = "Codex остановлен по таймауту"
-                stop_current_process()
+                stop_current_process(runtime)
                 break
         with process_lock:
-            error = error or active_error
-            stopped = active_stopped
+            error = error or runtime.active_error
+            stopped = runtime.active_stopped
         view.deliver(stopped=stopped, error=error)
     except Exception as exc:
         log(f"Codex worker failed: {exc}")
         view.deliver(error=compact(str(exc), 1000))
     finally:
         with process_lock:
-            active_view = None
-            active_done = None
-            active_turn_id = None
-            active_thread_id = None
-            active_error = None
-            active_stopped = False
-            active_last_event_at = None
-            paths = active_media_paths
-            active_media_paths = []
-            busy = False
+            runtime.active_view = None
+            runtime.active_done = None
+            runtime.active_turn_id = None
+            runtime.active_thread_id = None
+            runtime.active_error = None
+            runtime.active_stopped = False
+            runtime.active_last_event_at = None
+            paths = runtime.active_media_paths
+            runtime.active_media_paths = []
+            runtime.busy = False
         for path in paths:
             try:
                 os.unlink(path)
@@ -797,52 +882,52 @@ def run_turn(chat_id, inputs, thread_id, media_paths=None):
                 pass
 
 
-def run_compaction(chat_id, thread_id):
-    global busy, active_view, active_done, active_turn_id, active_thread_id
-    global active_error, active_stopped, active_last_event_at
+def run_compaction(runtime, thread_id):
+    chat_id = runtime.chat_id
     view = TurnView(chat_id)
     done = threading.Event()
     error = None
     try:
-        client = get_app_server()
+        client = get_app_server(runtime)
         client.start_if_needed()
-        server_thread_id = ensure_thread(client, thread_id)
+        server_thread_id = ensure_thread(runtime, client, thread_id)
         with process_lock:
-            active_view = view
-            active_done = done
-            active_turn_id = None
-            active_thread_id = server_thread_id
-            active_error = None
-            active_stopped = False
-            active_last_event_at = time.monotonic()
+            runtime.active_view = view
+            runtime.active_done = done
+            runtime.active_turn_id = None
+            runtime.active_thread_id = server_thread_id
+            runtime.active_error = None
+            runtime.active_stopped = False
+            runtime.active_last_event_at = time.monotonic()
         view.draft_thought = "🗜 Сжимаю контекст сессии…"
         view.flush(force=True)
         client.request("thread/compact/start", {"threadId": server_thread_id}, timeout=60)
         if not done.wait(TOTAL_TIMEOUT_S):
             error = "Сжатие контекста не завершилось за отведённое время."
         with process_lock:
-            error = error or active_error
+            error = error or runtime.active_error
         if error:
             send_plain(chat_id, f"🗜 Не удалось сжать контекст: {error}")
         else:
-            update_state(last_usage=None, session_usage=None, context_window=None)
+            update_state(chat_id, last_usage=None, session_usage=None, context_window=None)
             send_plain(chat_id, "🗜 Контекст сессии сжат. Можно продолжать.")
     except Exception as exc:
         send_plain(chat_id, f"🗜 Не удалось сжать контекст: {user_facing_codex_error(exc)}")
     finally:
         with process_lock:
-            active_view = None
-            active_done = None
-            active_turn_id = None
-            active_thread_id = None
-            active_error = None
-            active_stopped = False
-            active_last_event_at = None
-            busy = False
+            runtime.active_view = None
+            runtime.active_done = None
+            runtime.active_turn_id = None
+            runtime.active_thread_id = None
+            runtime.active_error = None
+            runtime.active_stopped = False
+            runtime.active_last_event_at = None
+            runtime.busy = False
 
 
-def session_files():
-    root = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")) / "sessions"
+def session_files(chat_id=OWNER_ID):
+    codex_home = tenant_codex_home(chat_id)
+    root = (codex_home or Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))) / "sessions"
     return sorted(root.glob("**/*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
 
 
@@ -866,10 +951,10 @@ def session_info(path):
     return sid, preview
 
 
-def session_message_count(thread_id):
+def session_message_count(chat_id, thread_id):
     if not thread_id:
         return None
-    for path in session_files():
+    for path in session_files(chat_id):
         sid, _ = session_info(path)
         if sid != thread_id:
             continue
@@ -929,20 +1014,20 @@ def rate_limit_line(label, window):
     )
 
 
-def build_usage_report():
-    global last_rate_limits
+def build_usage_report(runtime):
+    chat_id = runtime.chat_id
     with state_lock:
-        snapshot = dict(state)
+        snapshot = dict(chat_state(chat_id))
     thread_id = snapshot.get("thread_id")
     last = snapshot.get("last_usage") or {}
     total = snapshot.get("session_usage") or last
-    client = get_app_server()
+    client = get_app_server(runtime)
     limits_result = usage_result = None
     limits_error = usage_error = None
     try:
         limits_result = client.request("account/rateLimits/read", timeout=30)
         with process_lock:
-            last_rate_limits = (limits_result or {}).get("rateLimits") or last_rate_limits
+            runtime.last_rate_limits = (limits_result or {}).get("rateLimits") or runtime.last_rate_limits
     except Exception as exc:
         limits_error = compact(str(exc), 300)
     try:
@@ -952,7 +1037,7 @@ def build_usage_report():
     except Exception as exc:
         usage_error = compact(str(exc), 300)
 
-    messages = session_message_count(thread_id)
+    messages = session_message_count(chat_id, thread_id)
     context_tokens = last.get("input_tokens")
     context_window = snapshot.get("context_window")
     context = f"~{fmt_number(context_tokens)} tokens" if context_tokens else "нет данных"
@@ -995,12 +1080,11 @@ def build_usage_report():
     return "\n".join(lines)
 
 
-def refresh_rate_limits():
-    global last_rate_limits
+def refresh_rate_limits(runtime):
     try:
-        result = get_app_server().request("account/rateLimits/read", timeout=30)
+        result = get_app_server(runtime).request("account/rateLimits/read", timeout=30)
         with process_lock:
-            last_rate_limits = (result or {}).get("rateLimits") or last_rate_limits
+            runtime.last_rate_limits = (result or {}).get("rateLimits") or runtime.last_rate_limits
     except Exception as exc:
         log(f"Could not preload Codex rate limits: {exc}")
 
@@ -1033,7 +1117,7 @@ def restart_watcher():
         if not RESTART_SIGNAL_FILE.exists():
             continue
         with process_lock:
-            if busy:
+            if any(runtime.busy for runtime in tenants.values()):
                 continue
             restart_draining = True
         try:
@@ -1047,7 +1131,7 @@ def restart_watcher():
             pass
         result = send_plain(chat_id, "🔄 Текущий ход завершён. Перезапускаю Codex-бота…")
         message_id = (result.get("result") or {}).get("message_id") if result else None
-        update_state(
+        update_runtime_state(
             restart_completed_chat_id=chat_id,
             restart_message_id=message_id if isinstance(message_id, int) else None,
         )
@@ -1056,15 +1140,14 @@ def restart_watcher():
         return
 
 
-def stop_current_process():
-    global active_stopped
+def stop_current_process(runtime):
     with process_lock:
-        client = app_server
-        thread_id = active_thread_id
-        turn_id = active_turn_id
+        client = runtime.app_server
+        thread_id = runtime.active_thread_id
+        turn_id = runtime.active_turn_id
         if client is None or not thread_id or not turn_id:
             return False
-        active_stopped = True
+        runtime.active_stopped = True
     try:
         client.request("turn/interrupt", {"threadId": thread_id, "turnId": turn_id})
         return True
@@ -1073,15 +1156,14 @@ def stop_current_process():
         return False
 
 
-def steer_current_turn(inputs, media_paths=None):
-    global active_media_paths
+def steer_current_turn(runtime, inputs, media_paths=None):
     with process_lock:
-        client = app_server
-        thread_id = active_thread_id
-        turn_id = active_turn_id
+        client = runtime.app_server
+        thread_id = runtime.active_thread_id
+        turn_id = runtime.active_turn_id
         if client is None or not thread_id or not turn_id:
             return False, "активный ход ещё не успел получить ID — повтори через секунду"
-        active_media_paths.extend(media_paths or [])
+        runtime.active_media_paths.extend(media_paths or [])
     try:
         client.request("turn/steer", {
             "threadId": thread_id,
@@ -1093,86 +1175,148 @@ def steer_current_turn(inputs, media_paths=None):
         with process_lock:
             for path in media_paths or []:
                 try:
-                    active_media_paths.remove(path)
+                    runtime.active_media_paths.remove(path)
                 except ValueError:
                     pass
         return False, compact(str(exc), 500)
 
 
-def pause_active_draft():
+def pause_active_draft(runtime):
     with process_lock:
-        view = active_view
-        if not busy or view is None:
+        view = runtime.active_view
+        if not runtime.busy or view is None:
             return False
         view.draft_paused = True
         return True
 
 
+def start_account_login(runtime):
+    if runtime.chat_id == OWNER_ID:
+        send_plain(runtime.chat_id, "Владелец использует основной аккаунт ~/.codex; отдельный вход не требуется.")
+        return
+    try:
+        client = get_app_server(runtime)
+        client.start_if_needed()
+        result = client.request(
+            "account/login/start", {"type": "chatgptDeviceCode"}, timeout=60,
+        ) or {}
+        runtime.login_id = result.get("loginId")
+        update_state(runtime.chat_id, account_status="awaiting_login")
+        send_plain(
+            runtime.chat_id,
+            "🔐 Подключение отдельного аккаунта Codex\n\n"
+            f"1. Открой: {result.get('verificationUrl')}\n"
+            f"2. Введи код: {result.get('userCode')}\n\n"
+            "Токены сохранятся только в твоём изолированном CODEX_HOME. "
+            "Бот сообщит, когда вход завершится.",
+        )
+    except Exception as exc:
+        update_state(runtime.chat_id, account_status="login_failed")
+        send_plain(runtime.chat_id, f"Не удалось начать вход в Codex: {compact(str(exc), 500)}")
+
+
+def account_status_report(runtime):
+    try:
+        result = get_app_server(runtime).request("account/read", {"refreshToken": False}, timeout=30) or {}
+        account = result.get("account") or {}
+        if not account:
+            update_state(runtime.chat_id, account_status=None)
+            return "Аккаунт Codex не подключён. Используй /login."
+        update_state(runtime.chat_id, account_status="ready")
+        label = account.get("email") or account.get("type") or "подключён"
+        plan = account.get("planType") or account.get("plan_type")
+        return f"Аккаунт: {label}" + (f"\nПлан: {plan}" if plan else "")
+    except Exception as exc:
+        return f"Не удалось прочитать аккаунт: {compact(str(exc), 500)}"
+
+
+def account_is_ready(runtime):
+    if runtime.chat_id == OWNER_ID:
+        return True
+    try:
+        result = get_app_server(runtime).request(
+            "account/read", {"refreshToken": False}, timeout=30,
+        ) or {}
+        ready = bool(result.get("account"))
+        update_state(runtime.chat_id, account_status="ready" if ready else None)
+        return ready
+    except Exception as exc:
+        log(f"tenant={runtime.chat_id} account readiness check failed: {exc}")
+        return False
+
+
 def handle_command(chat_id, command):
-    global busy
+    runtime = get_tenant(chat_id)
     raw_cmd, _, arg = command.partition(" ")
     cmd = raw_cmd.split("@", 1)[0].lower().lstrip("/.")
     arg = arg.strip()
     if cmd in ("start", "help"):
         send_plain(chat_id, "Codex Telegram bridge. Команды доступны в меню бота.")
         return True
+    if cmd == "login":
+        threading.Thread(target=start_account_login, args=(runtime,), daemon=True).start()
+        return True
+    if cmd == "account":
+        send_plain(chat_id, account_status_report(runtime))
+        return True
     if cmd == "new":
-        stop_current_process()
-        update_state(thread_id=None, last_usage=None, session_usage=None, context_window=None)
+        stop_current_process(runtime)
+        update_state(chat_id, thread_id=None, last_usage=None, session_usage=None, context_window=None)
         send_plain(chat_id, "🆕 Текущий Codex-тред сброшен. Следующее сообщение начнёт новый.")
         return True
     if cmd == "sessions":
-        current = state.get("thread_id")
+        current = chat_state(chat_id).get("thread_id")
         rows = []
-        for path in session_files()[:10]:
+        for path in session_files(chat_id)[:10]:
             sid, preview = session_info(path)
             rows.append(f"{sid[:8]}{' ← текущая' if sid == current else ''}  {preview}")
         send_plain(chat_id, "Последние сессии:\n" + ("\n".join(rows) or "не найдены"))
         return True
     if cmd == "resume":
-        matches = [sid for path in session_files() for sid, _ in [session_info(path)]
+        matches = [sid for path in session_files(chat_id) for sid, _ in [session_info(path)]
                    if arg and sid.startswith(arg)]
         if len(matches) != 1:
             send_plain(chat_id, "Укажи однозначный id/префикс: /resume <id>" if matches else "Сессия не найдена.")
         else:
-            stop_current_process()
-            update_state(thread_id=matches[0], last_usage=None, session_usage=None, context_window=None)
+            stop_current_process(runtime)
+            update_state(chat_id, thread_id=matches[0], last_usage=None, session_usage=None, context_window=None)
             send_plain(chat_id, f"Продолжаю сессию {matches[0][:8]}.")
         return True
     if cmd == "status":
         with state_lock:
-            snapshot = dict(state)
+            snapshot = dict(chat_state(chat_id))
         send_plain(chat_id, "ℹ️ Статус\n"
                    f"Сессия: {(snapshot.get('thread_id') or 'нет')[:8]}\n"
                    f"Модель: {snapshot.get('model') or 'default'}\n"
                    f"Sandbox: {snapshot.get('sandbox')}\n"
                    f"Workspace: {snapshot.get('workspace')}\n"
-                   f"Занят: {'да' if busy else 'нет'}")
+                   f"Занят: {'да' if runtime.busy else 'нет'}\n"
+                   f"Аккаунт: {snapshot.get('account_status') or 'не подключён'}")
         return True
     if cmd == "usage":
-        send_plain(chat_id, build_usage_report())
+        send_plain(chat_id, build_usage_report(runtime))
         return True
     if cmd == "compact":
         with state_lock:
-            thread_id = state.get("thread_id")
+            thread_id = chat_state(chat_id).get("thread_id")
         if not thread_id:
             send_plain(chat_id, "Нет активной сессии для сжатия.")
             return True
         with process_lock:
-            if busy:
+            if runtime.busy:
                 already_busy = True
             else:
-                busy = True
+                runtime.busy = True
                 already_busy = False
         if already_busy:
             send_plain(chat_id, "Сначала дождись завершения текущего хода или используй /stop.")
         else:
             threading.Thread(
-                target=run_compaction, args=(chat_id, thread_id), daemon=True
+                target=run_compaction, args=(runtime, thread_id), daemon=True
             ).start()
         return True
     if cmd == "steer":
-        if pause_active_draft():
+        if pause_active_draft(runtime):
             # A regular message dismisses Telegram's native composer draft.
             # The view remains paused so the next progress event cannot seize
             # the input field again before the owner finishes typing.
@@ -1181,8 +1325,8 @@ def handle_command(chat_id, command):
             send_plain(chat_id, "Сейчас нет активного хода; просто отправь обычное сообщение.")
         return True
     if cmd == "model":
-        update_state(model=None if arg.lower() in ("", "default") else arg)
-        send_plain(chat_id, f"Модель: {state.get('model') or 'default'}.")
+        update_state(chat_id, model=None if arg.lower() in ("", "default") else arg)
+        send_plain(chat_id, f"Модель: {chat_state(chat_id).get('model') or 'default'}.")
         return True
     if cmd == "mode":
         aliases = {"read": "read-only", "read-only": "read-only", "write": "workspace-write",
@@ -1191,28 +1335,31 @@ def handle_command(chat_id, command):
         if arg not in aliases:
             send_plain(chat_id, "Использование: /mode read-only|workspace-write|full")
         else:
-            update_state(sandbox=aliases[arg])
+            update_state(chat_id, sandbox=aliases[arg])
             send_plain(chat_id, f"Sandbox: {aliases[arg]}.")
         return True
     if cmd == "workspace":
         path = CODEX_CWD if arg.lower() == "default" else os.path.abspath(os.path.expanduser(arg))
         if not arg:
-            send_plain(chat_id, f"Workspace: {state.get('workspace')}\nИспользование: /workspace <путь>|default")
+            send_plain(chat_id, f"Workspace: {chat_state(chat_id).get('workspace')}\nИспользование: /workspace <путь>|default")
         elif not os.path.isdir(path):
             send_plain(chat_id, f"Директория не существует: {path}")
         else:
-            update_state(workspace=path)
+            update_state(chat_id, workspace=path)
             send_plain(chat_id, f"Workspace: {path}")
         return True
     if cmd == "restart":
+        if chat_id != OWNER_ID:
+            send_plain(chat_id, "Перезапуск доступен только владельцу бота.")
+            return True
         request_restart(chat_id)
-        if busy:
+        if runtime.busy:
             send_plain(chat_id, "🔁 Перезапуск запланирован после завершения текущего хода.")
         else:
             send_plain(chat_id, "🔁 Перезапуск запланирован между ходами.")
         return True
     if cmd == "stop":
-        running = stop_current_process()
+        running = stop_current_process(runtime)
         if running:
             send_plain(chat_id, "⏹ Останавливаю текущее выполнение Codex.")
         else:
@@ -1225,10 +1372,13 @@ def handle_command(chat_id, command):
 
 
 def handle_message(message):
-    global busy
     chat_id = message.get("chat", {}).get("id")
-    if chat_id != OWNER_ID:
+    user_id = message.get("from", {}).get("id")
+    if str(user_id) not in load_whitelist():
+        if chat_id:
+            send_plain(chat_id, "⛔ Доступ к Codex-боту не разрешён. Попроси владельца добавить твой Telegram ID в whitelist.txt.")
         return
+    runtime = get_tenant(chat_id)
     text = message.get("text") or message.get("caption") or ""
     has_image = bool(message.get("photo")) or str(
         (message.get("document") or {}).get("mime_type", "")
@@ -1244,19 +1394,26 @@ def handle_message(message):
     if text.startswith(("/", ".")):
         handle_command(chat_id, text)
         return
+    account_status = chat_state(chat_id).get("account_status")
+    if chat_id != OWNER_ID and account_status != "ready" and not account_is_ready(runtime):
+        if account_status == "awaiting_login":
+            send_plain(chat_id, "Сначала заверши вход в Codex по ранее выданной ссылке.")
+        else:
+            threading.Thread(target=start_account_login, args=(runtime,), daemon=True).start()
+        return
     try:
         inputs, media_paths = message_inputs(message)
     except Exception as exc:
         send_plain(chat_id, f"Не смог скачать изображение: {compact(str(exc), 500)}")
         return
     with process_lock:
-        if busy:
+        if runtime.busy:
             already_busy = True
         else:
-            busy = True
+            runtime.busy = True
             already_busy = False
     if already_busy:
-        steered, error = steer_current_turn(inputs, media_paths)
+        steered, error = steer_current_turn(runtime, inputs, media_paths)
         if not steered:
             for path in media_paths:
                 try:
@@ -1266,9 +1423,9 @@ def handle_message(message):
             send_plain(chat_id, f"Не получилось добавить в текущий ход: {error}")
         return
     with state_lock:
-        thread_id = state.get("thread_id")
+        thread_id = chat_state(chat_id).get("thread_id")
     threading.Thread(
-        target=run_turn, args=(chat_id, inputs, thread_id, media_paths), daemon=True
+        target=run_turn, args=(runtime, inputs, thread_id, media_paths), daemon=True
     ).start()
 
 
@@ -1282,10 +1439,11 @@ def main():
     offset = None
     register_commands()
     with state_lock:
-        completed_restart_chat_id = state.get("restart_completed_chat_id")
-        completed_restart_message_id = state.get("restart_message_id")
+        runtime_state = state_db.get("runtime", {})
+        completed_restart_chat_id = runtime_state.get("restart_completed_chat_id")
+        completed_restart_message_id = runtime_state.get("restart_message_id")
     if completed_restart_chat_id:
-        update_state(restart_completed_chat_id=None, restart_message_id=None)
+        update_runtime_state(restart_completed_chat_id=None, restart_message_id=None)
         if completed_restart_message_id:
             result = edit_plain(
                 completed_restart_chat_id, completed_restart_message_id,
@@ -1296,8 +1454,9 @@ def main():
         else:
             send_plain(completed_restart_chat_id, "✅ Перезагрузка окончена, бот готов к работе.")
     try:
-        get_app_server().start_if_needed()
-        refresh_rate_limits()
+        owner_runtime = get_tenant(OWNER_ID)
+        get_app_server(owner_runtime).start_if_needed()
+        refresh_rate_limits(owner_runtime)
         log("Persistent Codex app-server is ready")
     except Exception as exc:
         log(f"Codex app-server warm start failed; will retry on first message: {exc}")
