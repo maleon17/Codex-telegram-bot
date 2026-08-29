@@ -337,6 +337,40 @@ def mdv2_code_block(value):
     return f"```\n{content}\n```"
 
 
+def pretty_tool_value(value, limit=1200):
+    """Human-sized tool input; never serialize an entire protocol envelope."""
+    if value in (None, "", [], {}):
+        return ""
+    if isinstance(value, str):
+        return compact(value, limit)
+    try:
+        return compact(json.dumps(value, ensure_ascii=False, indent=2), limit)
+    except (TypeError, ValueError):
+        return compact(str(value), limit)
+
+
+def tool_result_text(value, limit=1600):
+    """Extract useful text from MCP/dynamic output without IDs and metadata."""
+    if not isinstance(value, dict):
+        return pretty_tool_value(value, limit)
+    content = value.get("content") or value.get("contentItems") or []
+    texts = []
+    if isinstance(content, list):
+        for part in content:
+            if isinstance(part, dict):
+                text = part.get("text") or part.get("outputText")
+                if text:
+                    texts.append(str(text))
+    if texts:
+        return compact("\n".join(texts), limit)
+    error = value.get("error")
+    if error:
+        return pretty_tool_value(error, limit)
+    # Do not fall back to the full result object: it commonly contains
+    # structuredContent duplicates, resources, opaque IDs and base64 data.
+    return "результат получен"
+
+
 def truncate_mdv2(text, limit=MAX_MESSAGE_LEN):
     """Truncate without ever leaving a Telegram MarkdownV2 pre block open."""
     if len(text) <= limit:
@@ -359,10 +393,10 @@ def item_label_and_blocks(item):
         output = item.get("aggregated_output")
         results = []
         if output not in (None, ""):
-            results.append(("📤 Результат", str(output)))
+            results.append(("📤 Результат", compact(str(output), 1800)))
         if exit_code is not None:
             results.append(("🏁 Код завершения", str(exit_code)))
-        return "⚙️ Выполняю", command, results
+        return "⚙️ Выполняю", compact(command, 1400), results
     if item_type == "file_change":
         # App Server includes the complete patch in changes[*].kind.diff.  A
         # draft is progress UI, not a debug console: exposing that payload can
@@ -383,7 +417,64 @@ def item_label_and_blocks(item):
                 summaries.append(f"{path} — {labels.get(kind, kind or 'изменён')}")
         content = "\n".join(summaries) or str(item.get("path") or "файл изменён")
         return "📝 Изменение файла", compact(content, 1200), []
-    return f"🔧 {item_type}", json.dumps(item, ensure_ascii=False), []
+    if item_type == "web_search":
+        query = item.get("query") or "поиск"
+        action = item.get("action") or {}
+        action_type = action.get("type") if isinstance(action, dict) else None
+        labels = {"openPage": "открываю страницу", "findInPage": "ищу на странице",
+                  "search": "ищу в интернете"}
+        suffix = labels.get(action_type)
+        content = f"{suffix}: {query}" if suffix else str(query)
+        return "🔎 Поиск", compact(content, 1000), []
+    if item_type == "mcp_tool_call":
+        name = ".".join(filter(None, (item.get("server"), item.get("tool")))) or "MCP"
+        arguments = pretty_tool_value(item.get("arguments"))
+        results = []
+        if item.get("error"):
+            results.append(("❌ Ошибка", pretty_tool_value(item["error"], 1200)))
+        elif item.get("result") is not None:
+            results.append(("📤 Результат", tool_result_text(item["result"])))
+        return f"🧩 MCP · {name}", arguments or "выполняется", results
+    if item_type == "dynamic_tool_call":
+        name = ".".join(filter(None, (item.get("namespace"), item.get("tool")))) or "инструмент"
+        arguments = pretty_tool_value(item.get("arguments"))
+        results = []
+        if item.get("contentItems") is not None:
+            results.append(("📤 Результат", tool_result_text(
+                {"contentItems": item.get("contentItems")}
+            )))
+        return f"🔧 Инструмент · {name}", arguments or "выполняется", results
+    if item_type in ("collab_agent_tool_call", "sub_agent_activity"):
+        tool = item.get("tool") or item.get("kind") or "работа агента"
+        prompt = item.get("prompt")
+        states = item.get("agentsStates") or {}
+        state_text = ", ".join(
+            str(value.get("status") if isinstance(value, dict) else value)
+            for value in states.values()
+        )
+        content = pretty_tool_value(prompt, 1000) or state_text or str(tool)
+        return f"🤖 Агент · {tool}", content, []
+    if item_type == "image_view":
+        return "🖼 Просмотр изображения", compact(item.get("path") or "изображение", 1000), []
+    if item_type == "image_generation":
+        failure = item.get("failure")
+        return "🎨 Генерация изображения", (
+            pretty_tool_value(failure, 1000) if failure else "изображение создаётся"
+        ), []
+    if item_type == "context_compaction":
+        return "🗜 Сжатие контекста", "контекст сессии сжат", []
+    if item_type == "plan":
+        return "📋 План", compact(item.get("text") or "план обновлён", 1400), []
+    if item_type == "sleep":
+        seconds = (item.get("durationMs") or 0) / 1000
+        return "⏳ Ожидание", f"{seconds:g} с", []
+    if item_type in ("entered_review_mode", "exited_review_mode"):
+        text = "режим проверки включён" if item_type.startswith("entered") else "режим проверки завершён"
+        return "🔍 Проверка", text, []
+    # Future App Server item types must degrade to a short label. Never put
+    # the complete protocol object into Telegram: it may contain huge output,
+    # patches, base64 media, internal IDs or other implementation details.
+    return "🔧 Действие Codex", str(item_type).replace("_", " "), []
 
 
 def normalize_app_item(item):
@@ -401,6 +492,10 @@ def normalize_app_item(item):
         "imageView": "image_view",
         "collabAgentToolCall": "collab_agent_tool_call",
         "contextCompaction": "context_compaction",
+        "subAgentActivity": "sub_agent_activity",
+        "imageGeneration": "image_generation",
+        "enteredReviewMode": "entered_review_mode",
+        "exitedReviewMode": "exited_review_mode",
     }
     result["type"] = type_map.get(result.get("type"), result.get("type", "unknown"))
     if result["type"] == "reasoning":

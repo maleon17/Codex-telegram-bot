@@ -44,6 +44,39 @@ class RenderingTests(unittest.TestCase):
         })
         self.assertIn("/usage", message)
 
+    def test_every_app_server_tool_has_a_bounded_human_renderer(self):
+        fixtures = [
+            ({"type": "web_search", "id": "private-id", "query": "OpenAI",
+              "action": {"type": "search"}, "results": [{"opaque": "RAW"}]}, "OpenAI"),
+            ({"type": "mcp_tool_call", "id": "private-id", "server": "telegram",
+              "tool": "lookup", "arguments": {"query": "Андрей"},
+              "result": {"content": [{"type": "text", "text": "Найден"}],
+                         "structuredContent": {"opaque": "RAW"}}}, "telegram.lookup"),
+            ({"type": "dynamic_tool_call", "id": "private-id", "namespace": "demo",
+              "tool": "run", "arguments": {"x": 1},
+              "contentItems": [{"type": "text", "text": "готово"}]}, "demo.run"),
+            ({"type": "collab_agent_tool_call", "id": "private-id", "tool": "spawn",
+              "prompt": "проверить модуль", "receiverThreadIds": ["private-thread"]}, "spawn"),
+            ({"type": "sub_agent_activity", "id": "private-id", "kind": "waiting",
+              "agentThreadId": "private-thread"}, "waiting"),
+            ({"type": "image_view", "id": "private-id", "path": "/tmp/image.png"}, "image.png"),
+            ({"type": "image_generation", "id": "private-id"}, "изображение"),
+            ({"type": "context_compaction", "id": "private-id"}, "контекст"),
+            ({"type": "plan", "id": "private-id", "text": "Шаг 1"}, "Шаг 1"),
+            ({"type": "sleep", "id": "private-id", "durationMs": 1500}, "1.5"),
+            ({"type": "entered_review_mode", "id": "private-id"}, "проверки"),
+            ({"type": "futureTool", "id": "private-id", "payload": "RAW"}, "futureTool"),
+        ]
+        for item, expected in fixtures:
+            with self.subTest(item=item["type"]):
+                label, content, results = bot.item_label_and_blocks(item)
+                rendered = "\n".join([label, content] + [value for _, value in results])
+                self.assertIn(expected, rendered)
+                self.assertNotIn("private-id", rendered)
+                self.assertNotIn("private-thread", rendered)
+                self.assertNotIn('"type":', rendered)
+                self.assertLess(len(rendered), 4000)
+
 
 if __name__ == "__main__":
     unittest.main()
