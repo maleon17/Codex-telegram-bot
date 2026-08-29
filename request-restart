@@ -12,10 +12,22 @@ target = Path(os.environ.get(
     "CODEX_BOT_RESTART_FILE", Path(__file__).with_name("restart.request")
 )).expanduser()
 target.parent.mkdir(parents=True, exist_ok=True)
+owner_id = os.environ.get("OWNER_ID")
+if not owner_id:
+    env_file = Path(__file__).with_name(".env")
+    try:
+        for line in env_file.read_text(encoding="utf-8").splitlines():
+            if line.startswith("OWNER_ID="):
+                owner_id = line.partition("=")[2].strip()
+                break
+    except FileNotFoundError:
+        pass
 fd, temporary = tempfile.mkstemp(prefix=target.name + ".", dir=target.parent)
 with os.fdopen(fd, "w", encoding="utf-8") as handle:
-    json.dump({"chat_id": int(os.environ.get("OWNER_ID", "8480261623")),
-               "requested_at": time.time()}, handle)
+    payload = {"requested_at": time.time()}
+    if owner_id and owner_id.isdigit():
+        payload["chat_id"] = int(owner_id)
+    json.dump(payload, handle)
     handle.write("\n")
     handle.flush()
     os.fsync(handle.fileno())

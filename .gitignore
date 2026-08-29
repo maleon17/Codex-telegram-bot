@@ -4,3 +4,4 @@ state.json
 restart.request
 accounts/
 whitelist.txt
+.env

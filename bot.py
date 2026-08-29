@@ -364,10 +364,25 @@ def item_label_and_blocks(item):
             results.append(("🏁 Код завершения", str(exit_code)))
         return "⚙️ Выполняю", command, results
     if item_type == "file_change":
-        content = item.get("path", item.get("changes", item))
-        if not isinstance(content, str):
-            content = json.dumps(content, ensure_ascii=False)
-        return "📝 Изменение файла", content, []
+        # App Server includes the complete patch in changes[*].kind.diff.  A
+        # draft is progress UI, not a debug console: exposing that payload can
+        # fill the whole chat with escaped JSON and partially rendered code.
+        changes = item.get("changes") or []
+        if not isinstance(changes, list):
+            changes = [changes]
+        summaries = []
+        for change in changes:
+            if not isinstance(change, dict):
+                continue
+            path = change.get("path")
+            kind = change.get("kind")
+            if isinstance(kind, dict):
+                kind = kind.get("type")
+            labels = {"add": "создан", "delete": "удалён", "update": "изменён"}
+            if path:
+                summaries.append(f"{path} — {labels.get(kind, kind or 'изменён')}")
+        content = "\n".join(summaries) or str(item.get("path") or "файл изменён")
+        return "📝 Изменение файла", compact(content, 1200), []
     return f"🔧 {item_type}", json.dumps(item, ensure_ascii=False), []
 
 
@@ -1122,7 +1137,7 @@ def restart_watcher():
             restart_draining = True
         try:
             request = json.loads(RESTART_SIGNAL_FILE.read_text(encoding="utf-8"))
-            chat_id = request.get("chat_id") if isinstance(request, dict) else OWNER_ID
+            chat_id = (request.get("chat_id") if isinstance(request, dict) else None) or OWNER_ID
         except Exception:
             chat_id = OWNER_ID
         try:
