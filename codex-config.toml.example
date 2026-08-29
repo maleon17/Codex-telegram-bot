@@ -1,0 +1,9 @@
+# Merge this block into the service user's ~/.codex/config.toml when the
+# shared Telegram actions/triggers backend is enabled.
+
+[mcp_servers.telegram_actions]
+command = "/absolute/path/to/mcp-venv/bin/python3"
+args = ["/absolute/path/to/Codex-telegram-bot/telegram_actions_mcp.py"]
+startup_timeout_sec = 20.0
+tool_timeout_sec = 40.0
+default_tools_approval_mode = "auto"
