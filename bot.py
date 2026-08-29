@@ -10,6 +10,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 
 from app_server import AppServerClient, AppServerError
@@ -206,6 +207,7 @@ def load_state():
     if not STATE_FILE.exists():
         return {"thread_id": None, "model": None, "sandbox": CODEX_SANDBOX,
                 "workspace": CODEX_CWD, "last_usage": None,
+                "session_usage": None, "context_window": None,
                 "restart_completed_chat_id": None}
     try:
         data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
@@ -216,6 +218,10 @@ def load_state():
                 ("read-only", "workspace-write", "danger-full-access") else CODEX_SANDBOX,
                 "workspace": data.get("workspace") if isinstance(data.get("workspace"), str) else CODEX_CWD,
                 "last_usage": data.get("last_usage") if isinstance(data.get("last_usage"), dict) else None,
+                "session_usage": data.get("session_usage")
+                if isinstance(data.get("session_usage"), dict) else None,
+                "context_window": data.get("context_window")
+                if isinstance(data.get("context_window"), int) else None,
                 "restart_completed_chat_id": data.get("restart_completed_chat_id")
                 if isinstance(data.get("restart_completed_chat_id"), int) else None}
     except Exception as exc:
@@ -516,14 +522,19 @@ def get_app_server():
         return app_server
 
 
-def _usage_for_renderer(token_usage):
-    usage = (token_usage or {}).get("last") or {}
+def _usage_breakdown(usage):
     return {
         "input_tokens": usage.get("inputTokens", 0),
         "cached_input_tokens": usage.get("cachedInputTokens", 0),
+        "cache_write_input_tokens": usage.get("cacheWriteInputTokens", 0),
         "output_tokens": usage.get("outputTokens", 0),
         "reasoning_output_tokens": usage.get("reasoningOutputTokens", 0),
+        "total_tokens": usage.get("totalTokens", 0),
     }
+
+
+def _usage_for_renderer(token_usage):
+    return _usage_breakdown((token_usage or {}).get("last") or {})
 
 
 def handle_app_notification(method, params):
@@ -550,8 +561,13 @@ def handle_app_notification(method, params):
     elif method == "item/agentMessage/delta":
         view.draft_thought = (view.draft_thought or "") + str(params.get("delta", ""))
     elif method == "thread/tokenUsage/updated":
-        view.usage = _usage_for_renderer(params.get("tokenUsage"))
-        update_state(last_usage=view.usage)
+        token_usage = params.get("tokenUsage") or {}
+        view.usage = _usage_for_renderer(token_usage)
+        update_state(
+            last_usage=view.usage,
+            session_usage=_usage_breakdown(token_usage.get("total") or {}),
+            context_window=token_usage.get("modelContextWindow"),
+        )
     elif method == "error" and not params.get("willRetry"):
         with process_lock:
             active_error = compact(params.get("error", "неизвестная ошибка"), 1000)
@@ -719,6 +735,132 @@ def session_info(path):
     return sid, preview
 
 
+def session_message_count(thread_id):
+    if not thread_id:
+        return None
+    for path in session_files():
+        sid, _ = session_info(path)
+        if sid != thread_id:
+            continue
+        count = 0
+        try:
+            with path.open(encoding="utf-8") as handle:
+                for line in handle:
+                    obj = json.loads(line)
+                    payload = obj.get("payload") or {}
+                    if obj.get("type") != "response_item" or payload.get("role") != "user":
+                        continue
+                    text = " ".join(
+                        part.get("text", "") for part in payload.get("content", [])
+                        if part.get("type") == "input_text"
+                    ).strip()
+                    if text and not text.startswith((
+                        "<recommended_plugins>", "<environment_context>",
+                    )):
+                        count += 1
+            return count
+        except Exception:
+            return None
+    return None
+
+
+def fmt_number(value):
+    try:
+        return f"{int(value):,}".replace(",", " ")
+    except (TypeError, ValueError):
+        return "—"
+
+
+def format_reset_time(timestamp):
+    if not timestamp:
+        return "—"
+    try:
+        reset = datetime.fromtimestamp(int(timestamp)).astimezone()
+        remaining = max(0, int(timestamp) - int(time.time()))
+        if remaining < 3600:
+            relative = f"через {max(1, remaining // 60)} мин"
+        elif remaining < 86400:
+            relative = f"через {remaining // 3600} ч {remaining % 3600 // 60} мин"
+        else:
+            relative = f"через {remaining // 86400} д {remaining % 86400 // 3600} ч"
+        return f"{reset:%d.%m %H:%M} ({relative})"
+    except (TypeError, ValueError, OSError):
+        return "—"
+
+
+def rate_limit_line(label, window):
+    if not isinstance(window, dict):
+        return f"{label}: нет данных"
+    used = int(window.get("usedPercent") or 0)
+    return (
+        f"{label}: использовано {used}% · осталось {max(0, 100 - used)}% · "
+        f"сброс {format_reset_time(window.get('resetsAt'))}"
+    )
+
+
+def build_usage_report():
+    with state_lock:
+        snapshot = dict(state)
+    thread_id = snapshot.get("thread_id")
+    last = snapshot.get("last_usage") or {}
+    total = snapshot.get("session_usage") or last
+    client = get_app_server()
+    limits_result = usage_result = None
+    limits_error = usage_error = None
+    try:
+        limits_result = client.request("account/rateLimits/read", timeout=30)
+    except Exception as exc:
+        limits_error = compact(str(exc), 300)
+    try:
+        usage_result = client.request(
+            "account/usage/read", {"threadId": thread_id} if thread_id else {}, timeout=30,
+        )
+    except Exception as exc:
+        usage_error = compact(str(exc), 300)
+
+    messages = session_message_count(thread_id)
+    context_tokens = last.get("input_tokens")
+    context_window = snapshot.get("context_window")
+    context = f"~{fmt_number(context_tokens)} tokens" if context_tokens else "нет данных"
+    if context_tokens and context_window:
+        context += f" / {fmt_number(context_window)} ({context_tokens / context_window:.1%})"
+    lines = [
+        "📊 Session",
+        f"{(thread_id or 'нет активной')[:8]}  •  Model: {snapshot.get('model') or 'default'}",
+        f"Messages: {messages if messages is not None else '—'}",
+        f"Context: {context}",
+        "",
+        "🔢 Tokens (this session)",
+        f"in {fmt_number(total.get('input_tokens'))}  ·  out {fmt_number(total.get('output_tokens'))}  ·  "
+        f"cache-r {fmt_number(total.get('cached_input_tokens'))}  ·  "
+        f"cache-w {fmt_number(total.get('cache_write_input_tokens'))}",
+    ]
+    thread_usage = (usage_result or {}).get("threadUsage") or {}
+    usd_micros = thread_usage.get("estimatedUsageUsdMicros")
+    if usd_micros is not None:
+        lines.append(f"(~${usd_micros / 1_000_000:.4f} эквивалент по API-тарифу)")
+    elif usage_error:
+        lines.append(f"Стоимость: не удалось получить ({usage_error})")
+    else:
+        lines.append("Стоимость: недоступна для текущего subscription-маршрута")
+
+    lines.extend(("", "📈 Account limits (subscription, not credits)"))
+    limits = (limits_result or {}).get("rateLimits") or {}
+    if limits:
+        plan = limits.get("planType")
+        if plan:
+            lines.append(f"Plan: {str(plan).replace('_', ' ').title()}")
+        lines.append(rate_limit_line("5-hour", limits.get("primary")))
+        lines.append(rate_limit_line("Weekly", limits.get("secondary")))
+        credits = limits.get("credits") or {}
+        if credits.get("hasCredits") or credits.get("unlimited"):
+            balance = "unlimited" if credits.get("unlimited") else credits.get("balance")
+            lines.append(f"Credits: {balance}")
+    else:
+        lines.append(f"Не удалось получить: {limits_error or 'нет данных'}")
+    return "\n".join(lines)
+
+
 def request_restart(chat_id):
     """Persist a restart request; the watcher executes it only between turns."""
     RESTART_SIGNAL_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -819,7 +961,7 @@ def handle_command(chat_id, command):
         return True
     if cmd == "new":
         stop_current_process()
-        save_thread_id(None)
+        update_state(thread_id=None, last_usage=None, session_usage=None, context_window=None)
         send_plain(chat_id, "🆕 Текущий Codex-тред сброшен. Следующее сообщение начнёт новый.")
         return True
     if cmd == "sessions":
@@ -837,7 +979,7 @@ def handle_command(chat_id, command):
             send_plain(chat_id, "Укажи однозначный id/префикс: /resume <id>" if matches else "Сессия не найдена.")
         else:
             stop_current_process()
-            save_thread_id(matches[0])
+            update_state(thread_id=matches[0], last_usage=None, session_usage=None, context_window=None)
             send_plain(chat_id, f"Продолжаю сессию {matches[0][:8]}.")
         return True
     if cmd == "status":
@@ -851,9 +993,7 @@ def handle_command(chat_id, command):
                    f"Занят: {'да' if busy else 'нет'}")
         return True
     if cmd == "usage":
-        with state_lock:
-            usage = state.get("last_usage")
-        send_plain(chat_id, "Токены последнего запроса: " + (format_usage(usage) if usage else "данных пока нет"))
+        send_plain(chat_id, build_usage_report())
         return True
     if cmd == "model":
         update_state(model=None if arg.lower() in ("", "default") else arg)
