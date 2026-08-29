@@ -18,6 +18,27 @@ spec.loader.exec_module(bot)
 
 
 class RenderingTests(unittest.TestCase):
+    def test_tool_progress_uses_concrete_claude_style_labels(self):
+        label, content, _ = bot.item_label_and_blocks({
+            "type": "command_execution", "command": "printf hello",
+        })
+        self.assertEqual(label, "🔧 Bash")
+        self.assertEqual(content, "printf hello")
+        self.assertNotIn("Выполняю", label)
+
+        label, content, _ = bot.item_label_and_blocks({
+            "type": "mcp_tool_call", "server": "telegram", "tool": "lookup",
+        })
+        self.assertEqual(label, "🔧 telegram.lookup")
+        self.assertEqual(content, "")
+        self.assertNotIn("выполняется", content)
+
+        label, content, _ = bot.item_label_and_blocks({
+            "type": "future_tool", "payload": "opaque",
+        })
+        self.assertEqual(label, "🔧 Инструмент")
+        self.assertNotIn("Действие Codex", label)
+
     def test_file_change_draft_never_exposes_patch(self):
         item = {
             "type": "file_change",

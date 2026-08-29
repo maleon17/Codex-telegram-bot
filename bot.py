@@ -390,15 +390,21 @@ def item_label_and_blocks(item):
     if item_type == "reasoning":
         return "🧠 Размышление", item.get("text", item.get("summary", "")), []
     if item_type == "command_execution":
-        command = item.get("command", "")
+        command = item.get("command") or item.get("commandLine") or ""
         exit_code = item.get("exit_code")
         output = item.get("aggregated_output")
         results = []
         if output not in (None, ""):
             results.append(("📤 Результат", compact(str(output), 1800)))
         if exit_code is not None:
-            results.append(("🏁 Код завершения", str(exit_code)))
-        return "⚙️ Выполняю", compact(command, 1400), results
+            try:
+                succeeded = int(exit_code) == 0
+            except (TypeError, ValueError):
+                succeeded = False
+            results.append(("✅ Код завершения" if succeeded else "❌ Код завершения", str(exit_code)))
+        # Match Claude's live renderer: identify the concrete tool instead of
+        # exposing a generic "Выполняю" status.
+        return "🔧 Bash", compact(command, 1400), results
     if item_type == "file_change":
         # App Server includes the complete patch in changes[*].kind.diff.  A
         # draft is progress UI, not a debug console: exposing that payload can
@@ -436,7 +442,7 @@ def item_label_and_blocks(item):
             results.append(("❌ Ошибка", pretty_tool_value(item["error"], 1200)))
         elif item.get("result") is not None:
             results.append(("📤 Результат", tool_result_text(item["result"])))
-        return f"🧩 MCP · {name}", arguments or "выполняется", results
+        return f"🔧 {name}", arguments, results
     if item_type == "dynamic_tool_call":
         name = ".".join(filter(None, (item.get("namespace"), item.get("tool")))) or "инструмент"
         arguments = pretty_tool_value(item.get("arguments"))
@@ -445,7 +451,7 @@ def item_label_and_blocks(item):
             results.append(("📤 Результат", tool_result_text(
                 {"contentItems": item.get("contentItems")}
             )))
-        return f"🔧 Инструмент · {name}", arguments or "выполняется", results
+        return f"🔧 {name}", arguments, results
     if item_type in ("collab_agent_tool_call", "sub_agent_activity"):
         tool = item.get("tool") or item.get("kind") or "работа агента"
         prompt = item.get("prompt")
@@ -476,7 +482,10 @@ def item_label_and_blocks(item):
     # Future App Server item types must degrade to a short label. Never put
     # the complete protocol object into Telegram: it may contain huge output,
     # patches, base64 media, internal IDs or other implementation details.
-    return "🔧 Действие Codex", str(item_type).replace("_", " "), []
+    # Unknown/future protocol items still get a useful, neutral label.  Do
+    # not leak the product name or invent a fake "action"/"in progress"
+    # payload when the protocol did not provide one.
+    return "🔧 Инструмент", str(item_type).replace("_", " "), []
 
 
 def normalize_app_item(item):
@@ -665,10 +674,15 @@ class TurnView:
     def live_text(self):
         lines = []
         if self.draft_thought:
-            lines.append(escape_mdv2(str(self.draft_thought)))
+            # Claude uses a neutral writing/thought line while a response is
+            # forming.  The spinner is the only activity indicator; don't
+            # inject a second, abrupt 🤔 marker into the body.
+            lines.append(escape_mdv2(f"✍️ {self.draft_thought}"))
         if self.draft_tool:
             label, content, results = item_label_and_blocks(self.draft_tool)
-            lines.extend((escape_mdv2(f"{label}:"), mdv2_code_block(content)))
+            lines.append(escape_mdv2(f"{label}:"))
+            if content:
+                lines.append(mdv2_code_block(content))
             for result_label, result_content in results:
                 lines.extend((escape_mdv2(f"{result_label}:"),
                               mdv2_code_block(result_content)))
