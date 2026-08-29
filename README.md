@@ -9,6 +9,8 @@ on the Claude bridge.
 The bot keeps one `codex app-server` child alive for its whole lifetime. A
 Telegram message starts a turn; another ordinary message received while that
 turn is active is appended with `turn/steer`. `/stop` uses `turn/interrupt`.
+`/restart` and `./request-restart` only schedule a restart: the watcher exits
+after the active turn and final Telegram delivery, never during an answer.
 
 Runtime state is stored in `state.json` and is ignored by git.
 

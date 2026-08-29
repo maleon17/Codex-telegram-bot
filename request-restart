@@ -1,0 +1,23 @@
+#!/usr/bin/env python3
+"""Schedule a safe bot restart via the running process's watcher."""
+
+import json
+import os
+import tempfile
+import time
+from pathlib import Path
+
+
+target = Path(os.environ.get(
+    "CODEX_BOT_RESTART_FILE", Path(__file__).with_name("restart.request")
+)).expanduser()
+target.parent.mkdir(parents=True, exist_ok=True)
+fd, temporary = tempfile.mkstemp(prefix=target.name + ".", dir=target.parent)
+with os.fdopen(fd, "w", encoding="utf-8") as handle:
+    json.dump({"chat_id": int(os.environ.get("OWNER_ID", "8480261623")),
+               "requested_at": time.time()}, handle)
+    handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+os.replace(temporary, target)
+print(f"Safe restart scheduled via {target}")

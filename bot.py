@@ -59,6 +59,9 @@ CODEX_SANDBOX = os.environ.get("CODEX_SANDBOX", "danger-full-access")
 STATE_FILE = Path(
     os.environ.get("CODEX_BOT_STATE_FILE", Path(__file__).with_name("state.json"))
 ).expanduser()
+RESTART_SIGNAL_FILE = Path(os.environ.get(
+    "CODEX_BOT_RESTART_FILE", Path(__file__).with_name("restart.request")
+)).expanduser()
 API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 state_lock = threading.Lock()
@@ -76,6 +79,7 @@ active_thread_id = None
 active_error = None
 active_stopped = False
 active_last_event_at = None
+restart_draining = False
 
 
 def _rate_limited(result):
@@ -145,7 +149,8 @@ def tg_call(method, params=None, timeout=HTTP_TIMEOUT_S):
 def load_state():
     if not STATE_FILE.exists():
         return {"thread_id": None, "model": None, "sandbox": CODEX_SANDBOX,
-                "workspace": CODEX_CWD, "last_usage": None}
+                "workspace": CODEX_CWD, "last_usage": None,
+                "restart_completed_chat_id": None}
     try:
         data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
         thread_id = data.get("thread_id") if isinstance(data, dict) else None
@@ -154,7 +159,9 @@ def load_state():
                 "sandbox": data.get("sandbox") if data.get("sandbox") in
                 ("read-only", "workspace-write", "danger-full-access") else CODEX_SANDBOX,
                 "workspace": data.get("workspace") if isinstance(data.get("workspace"), str) else CODEX_CWD,
-                "last_usage": data.get("last_usage") if isinstance(data.get("last_usage"), dict) else None}
+                "last_usage": data.get("last_usage") if isinstance(data.get("last_usage"), dict) else None,
+                "restart_completed_chat_id": data.get("restart_completed_chat_id")
+                if isinstance(data.get("restart_completed_chat_id"), int) else None}
     except Exception as exc:
         raise SystemExit(f"codex-telegram-bot: cannot read state file {STATE_FILE}: {exc}") from exc
 
@@ -632,9 +639,51 @@ def session_info(path):
     return sid, preview
 
 
-def restart_self():
-    time.sleep(0.5)  # let Telegram receive the acknowledgement first
-    os.kill(os.getpid(), signal.SIGTERM)
+def request_restart(chat_id):
+    """Persist a restart request; the watcher executes it only between turns."""
+    RESTART_SIGNAL_FILE.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(
+        prefix=RESTART_SIGNAL_FILE.name + ".", dir=RESTART_SIGNAL_FILE.parent
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump({"chat_id": chat_id, "requested_at": time.time()}, handle)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, RESTART_SIGNAL_FILE)
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def restart_watcher():
+    global restart_draining
+    while True:
+        time.sleep(0.5)
+        if not RESTART_SIGNAL_FILE.exists():
+            continue
+        with process_lock:
+            if busy:
+                continue
+            restart_draining = True
+        try:
+            request = json.loads(RESTART_SIGNAL_FILE.read_text(encoding="utf-8"))
+            chat_id = request.get("chat_id") if isinstance(request, dict) else OWNER_ID
+        except Exception:
+            chat_id = OWNER_ID
+        try:
+            RESTART_SIGNAL_FILE.unlink()
+        except FileNotFoundError:
+            pass
+        update_state(restart_completed_chat_id=chat_id)
+        send_plain(chat_id, "🔄 Текущий ход завершён. Перезапускаю Codex-бота…")
+        time.sleep(0.5)
+        os.kill(os.getpid(), signal.SIGTERM)
+        return
 
 
 def stop_current_process():
@@ -743,8 +792,11 @@ def handle_command(chat_id, command):
             send_plain(chat_id, f"Workspace: {path}")
         return True
     if cmd == "restart":
-        send_plain(chat_id, "🔄 Перезапускаю Codex-бота…")
-        threading.Thread(target=restart_self, daemon=True).start()
+        request_restart(chat_id)
+        if busy:
+            send_plain(chat_id, "🔁 Перезапуск запланирован после завершения текущего хода.")
+        else:
+            send_plain(chat_id, "🔁 Перезапуск запланирован между ходами.")
         return True
     if cmd == "stop":
         running = stop_current_process()
@@ -768,6 +820,11 @@ def handle_message(message):
     if not isinstance(text, str) or not text.strip():
         return
     text = text.strip()
+    with process_lock:
+        draining = restart_draining
+    if draining:
+        send_plain(chat_id, "🔄 Уже начинаю перезапуск; сообщение пока не принято.")
+        return
     if text.startswith(("/", ".")):
         handle_command(chat_id, text)
         return
@@ -798,11 +855,17 @@ def register_commands():
 def main():
     offset = None
     register_commands()
+    with state_lock:
+        completed_restart_chat_id = state.get("restart_completed_chat_id")
+    if completed_restart_chat_id:
+        update_state(restart_completed_chat_id=None)
+        send_plain(completed_restart_chat_id, "✅ Перезагрузка окончена, бот готов к работе.")
     try:
         get_app_server().start_if_needed()
         log("Persistent Codex app-server is ready")
     except Exception as exc:
         log(f"Codex app-server warm start failed; will retry on first message: {exc}")
+    threading.Thread(target=restart_watcher, daemon=True).start()
     log(f"Codex Telegram bot started; owner={OWNER_ID}, cwd={CODEX_CWD}")
     while True:
         params = {"timeout": 30, "allowed_updates": ["message"]}
