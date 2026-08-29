@@ -95,7 +95,8 @@ journalctl -u codex-telegram-bot -f
 | `/steer` | Pause the native draft and free the input field for a mid-turn follow-up |
 | `/compact` | Compact the current thread context |
 | `/usage` | Session tokens, context and account rate limits |
-| `/model <id>` | Override the Codex model; `/model default` resets it |
+| `/model [id]` | Show available models or select one by its real ID |
+| `/effort [level]` | Show or select the reasoning power supported by the current model |
 | `/mode read-only\|workspace-write\|full` | Select the sandbox policy |
 | `/workspace <path>\|default` | Select the working directory |
 | `/account` | Show the current isolated Codex account |

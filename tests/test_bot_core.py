@@ -78,5 +78,50 @@ class RenderingTests(unittest.TestCase):
                 self.assertLess(len(rendered), 4000)
 
 
+class ModelCommandTests(unittest.TestCase):
+    CATALOG = [
+        {"id": "gpt-5.6-sol", "model": "gpt-5.6-sol", "displayName": "GPT-5.6-Sol",
+         "isDefault": True, "hidden": False, "defaultReasoningEffort": "low",
+         "supportedReasoningEfforts": [
+             {"reasoningEffort": "low", "description": "Fast"},
+             {"reasoningEffort": "high", "description": "Deep"},
+         ]},
+        {"id": "gpt-5.6-luna", "model": "gpt-5.6-luna", "displayName": "GPT-5.6-Luna",
+         "isDefault": False, "hidden": False, "defaultReasoningEffort": "high",
+         "supportedReasoningEfforts": [
+             {"reasoningEffort": "high", "description": "Deep"},
+         ]},
+    ]
+
+    def setUp(self):
+        self.original_models = bot.available_models
+        self.original_send = bot.send_plain
+        bot.available_models = lambda runtime: self.CATALOG
+        self.messages = []
+        bot.send_plain = lambda chat_id, text: self.messages.append(text)
+        bot.update_state(1, model=None, effort=None)
+
+    def tearDown(self):
+        bot.available_models = self.original_models
+        bot.send_plain = self.original_send
+
+    def test_model_without_argument_lists_real_models_and_selects_actual_default(self):
+        bot.handle_command(1, "/model")
+        text = self.messages[-1]
+        self.assertIn("/model gpt-5.6-sol", text)
+        self.assertIn("/model gpt-5.6-luna", text)
+        self.assertNotIn("default", text.lower())
+        self.assertEqual(bot.chat_state(1)["model"], "gpt-5.6-sol")
+        self.assertEqual(bot.chat_state(1)["effort"], "low")
+
+    def test_effort_without_argument_lists_only_current_model_levels(self):
+        bot.handle_command(1, "/model gpt-5.6-sol")
+        bot.handle_command(1, "/effort")
+        self.assertIn("/effort low", self.messages[-1])
+        self.assertIn("/effort high", self.messages[-1])
+        bot.handle_command(1, "/effort high")
+        self.assertEqual(bot.chat_state(1)["effort"], "high")
+
+
 if __name__ == "__main__":
     unittest.main()

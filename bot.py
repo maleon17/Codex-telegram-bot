@@ -34,6 +34,7 @@ COMMANDS = [
     ("usage", "Токены последнего запроса"),
     ("compact", "Сжать контекст текущей сессии"),
     ("model", "Выбрать модель Codex"),
+    ("effort", "Выбрать мощность модели"),
     ("mode", "Sandbox: read-only/workspace-write/full"),
     ("workspace", "Рабочая директория"),
     ("account", "Состояние аккаунта Codex"),
@@ -280,6 +281,7 @@ def chat_state(chat_id):
         entry = state_db["chats"].setdefault(str(chat_id), {})
         entry.setdefault("thread_id", None)
         entry.setdefault("model", None)
+        entry.setdefault("effort", None)
         entry.setdefault("sandbox", CODEX_SANDBOX)
         entry.setdefault("workspace", CODEX_CWD)
         entry.setdefault("last_usage", None)
@@ -882,6 +884,78 @@ def _thread_params(runtime, thread_id=None):
     return params
 
 
+def available_models(runtime):
+    """Return the visible live model catalog advertised by App Server."""
+    result = get_app_server(runtime).request(
+        "model/list", {"limit": 100, "includeHidden": False}, timeout=30,
+    ) or {}
+    return [model for model in result.get("data", [])
+            if isinstance(model, dict) and not model.get("hidden")]
+
+
+def model_key(model):
+    return str(model.get("model") or model.get("id") or "")
+
+
+def selected_model(runtime, models=None, persist=True):
+    models = models if models is not None else available_models(runtime)
+    with state_lock:
+        snapshot = dict(chat_state(runtime.chat_id))
+    current = snapshot.get("model")
+    chosen = next((model for model in models if model_key(model) == current), None)
+    if chosen is None:
+        chosen = next((model for model in models if model.get("isDefault")), None)
+    if chosen is None and models:
+        chosen = models[0]
+    if chosen and persist:
+        updates = {}
+        key = model_key(chosen)
+        if current != key:
+            updates["model"] = key
+        supported = [option.get("reasoningEffort") for option in
+                     chosen.get("supportedReasoningEfforts", []) if isinstance(option, dict)]
+        if snapshot.get("effort") not in supported:
+            updates["effort"] = chosen.get("defaultReasoningEffort") or (supported[0] if supported else None)
+        if updates:
+            update_state(runtime.chat_id, **updates)
+    return chosen
+
+
+def render_model_picker(runtime):
+    models = available_models(runtime)
+    chosen = selected_model(runtime, models)
+    current = model_key(chosen) if chosen else None
+    lines = ["🧠 Доступные модели:"]
+    for model in models:
+        key = model_key(model)
+        name = model.get("displayName") or key
+        lines.append(f"{'●' if key == current else '○'} {name} — /model {key}")
+    if not models:
+        lines.append("Список моделей пуст.")
+    return "\n".join(lines)
+
+
+def render_effort_picker(runtime):
+    models = available_models(runtime)
+    chosen = selected_model(runtime, models)
+    if not chosen:
+        return "Codex не вернул доступных моделей."
+    current = chat_state(runtime.chat_id).get("effort")
+    lines = [f"⚡ Мощность модели {chosen.get('displayName') or model_key(chosen)}:"]
+    for option in chosen.get("supportedReasoningEfforts", []):
+        if not isinstance(option, dict):
+            continue
+        effort = option.get("reasoningEffort")
+        if not effort:
+            continue
+        description = option.get("description")
+        line = f"{'●' if effort == current else '○'} {effort} — /effort {effort}"
+        if description:
+            line += f"\n   {description}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def ensure_thread(runtime, client, requested_thread_id):
     process_pid = client.process.pid if client.process is not None else None
     with process_lock:
@@ -924,6 +998,12 @@ def run_turn(runtime, inputs, thread_id, media_paths=None):
     try:
         client = get_app_server(runtime)
         client.start_if_needed()
+        with state_lock:
+            needs_model_settings = not (
+                chat_state(chat_id).get("model") and chat_state(chat_id).get("effort")
+            )
+        if needs_model_settings:
+            selected_model(runtime)
         server_thread_id = ensure_thread(runtime, client, thread_id)
         with state_lock:
             snapshot = dict(chat_state(chat_id))
@@ -949,6 +1029,8 @@ def run_turn(runtime, inputs, thread_id, media_paths=None):
         }
         if snapshot.get("model"):
             params["model"] = snapshot["model"]
+        if snapshot.get("effort"):
+            params["effort"] = snapshot["effort"]
         result = client.request("turn/start", params, timeout=60)
         turn_id = ((result or {}).get("turn") or {}).get("id")
         with process_lock:
@@ -1126,6 +1208,11 @@ def rate_limit_line(label, window):
 
 def build_usage_report(runtime):
     chat_id = runtime.chat_id
+    try:
+        if not chat_state(chat_id).get("model"):
+            selected_model(runtime)
+    except Exception as exc:
+        log(f"Could not resolve model for usage: {exc}")
     with state_lock:
         snapshot = dict(chat_state(chat_id))
     thread_id = snapshot.get("thread_id")
@@ -1155,7 +1242,8 @@ def build_usage_report(runtime):
         context += f" / {fmt_number(context_window)} ({context_tokens / context_window:.1%})"
     lines = [
         "📊 Session",
-        f"{(thread_id or 'нет активной')[:8]}  •  Model: {snapshot.get('model') or 'default'}",
+        f"{(thread_id or 'нет активной')[:8]}  •  Model: {snapshot.get('model') or 'не определена'}"
+        f"  •  Effort: {snapshot.get('effort') or 'не определён'}",
         f"Messages: {messages if messages is not None else '—'}",
         f"Context: {context}",
         "",
@@ -1393,11 +1481,16 @@ def handle_command(chat_id, command):
             send_plain(chat_id, f"Продолжаю сессию {matches[0][:8]}.")
         return True
     if cmd == "status":
+        try:
+            selected_model(runtime)
+        except Exception as exc:
+            log(f"Could not resolve model for status: {exc}")
         with state_lock:
             snapshot = dict(chat_state(chat_id))
         send_plain(chat_id, "ℹ️ Статус\n"
                    f"Сессия: {(snapshot.get('thread_id') or 'нет')[:8]}\n"
-                   f"Модель: {snapshot.get('model') or 'default'}\n"
+                   f"Модель: {snapshot.get('model') or 'не определена'}\n"
+                   f"Мощность: {snapshot.get('effort') or 'не определена'}\n"
                    f"Sandbox: {snapshot.get('sandbox')}\n"
                    f"Workspace: {snapshot.get('workspace')}\n"
                    f"Занят: {'да' if runtime.busy else 'нет'}\n"
@@ -1435,8 +1528,51 @@ def handle_command(chat_id, command):
             send_plain(chat_id, "Сейчас нет активного хода; просто отправь обычное сообщение.")
         return True
     if cmd == "model":
-        update_state(chat_id, model=None if arg.lower() in ("", "default") else arg)
-        send_plain(chat_id, f"Модель: {chat_state(chat_id).get('model') or 'default'}.")
+        try:
+            models = available_models(runtime)
+            if not arg:
+                send_plain(chat_id, render_model_picker(runtime))
+                return True
+            chosen = next((model for model in models if arg.lower() in {
+                model_key(model).lower(), str(model.get("id") or "").lower(),
+                str(model.get("displayName") or "").lower(),
+            }), None)
+            if chosen is None:
+                send_plain(chat_id, f"Модель «{arg}» недоступна.\n\n{render_model_picker(runtime)}")
+                return True
+            supported = [option.get("reasoningEffort") for option in
+                         chosen.get("supportedReasoningEfforts", []) if isinstance(option, dict)]
+            current_effort = chat_state(chat_id).get("effort")
+            effort = (current_effort if current_effort in supported else
+                      chosen.get("defaultReasoningEffort") or (supported[0] if supported else None))
+            update_state(chat_id, model=model_key(chosen), effort=effort)
+            send_plain(chat_id, f"🧠 Модель: {chosen.get('displayName') or model_key(chosen)}\n"
+                       f"Мощность: {effort or 'не поддерживается'}")
+        except Exception as exc:
+            send_plain(chat_id, f"Не удалось получить список моделей: {compact(str(exc), 500)}")
+        return True
+    if cmd == "effort":
+        try:
+            models = available_models(runtime)
+            chosen = selected_model(runtime, models)
+            if not chosen:
+                send_plain(chat_id, "Codex не вернул доступных моделей.")
+                return True
+            options = [option for option in chosen.get("supportedReasoningEfforts", [])
+                       if isinstance(option, dict) and option.get("reasoningEffort")]
+            if not arg:
+                send_plain(chat_id, render_effort_picker(runtime))
+                return True
+            effort = next((option["reasoningEffort"] for option in options
+                           if option["reasoningEffort"].lower() == arg.lower()), None)
+            if effort is None:
+                send_plain(chat_id, f"Мощность «{arg}» недоступна для {model_key(chosen)}.\n\n"
+                           f"{render_effort_picker(runtime)}")
+                return True
+            update_state(chat_id, effort=effort)
+            send_plain(chat_id, f"⚡ Мощность {chosen.get('displayName') or model_key(chosen)}: {effort}")
+        except Exception as exc:
+            send_plain(chat_id, f"Не удалось получить уровни мощности: {compact(str(exc), 500)}")
         return True
     if cmd == "mode":
         aliases = {"read": "read-only", "read-only": "read-only", "write": "workspace-write",
