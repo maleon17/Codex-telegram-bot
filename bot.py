@@ -23,7 +23,6 @@ RICH_MAX_CHARS = 30000
 HTTP_TIMEOUT_S = 20
 IDLE_TIMEOUT_S = 300
 TOTAL_TIMEOUT_S = 1800
-THINKING_SPINNER_FRAMES = "⠋⠙⠚⠞⠖⠦⠴⠲⠳⠓"
 COMMANDS = [
     ("new", "Начать новую Codex-сессию"),
     ("sessions", "Список последних сессий"),
@@ -351,6 +350,27 @@ def pretty_tool_value(value, limit=1200):
         return compact(str(value), limit)
 
 
+def protocol_text(value):
+    """Extract readable text from App Server text/summary values."""
+    if value in (None, ""):
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts = []
+        for part in value:
+            if isinstance(part, str):
+                text = part
+            elif isinstance(part, dict):
+                text = part.get("text") or part.get("summary") or part.get("content") or ""
+            else:
+                text = str(part)
+            if text:
+                parts.append(str(text))
+        return "\n".join(parts)
+    return str(value)
+
+
 def tool_result_text(value, limit=1600):
     """Extract useful text from MCP/dynamic output without IDs and metadata."""
     if not isinstance(value, dict):
@@ -386,9 +406,11 @@ def truncate_mdv2(text, limit=MAX_MESSAGE_LEN):
 def item_label_and_blocks(item):
     item_type = item.get("type", "unknown")
     if item_type == "agent_message":
-        return "💬 Ответ", item.get("text", ""), []
+        return "💬 Ответ", protocol_text(item.get("text", "")), []
     if item_type == "reasoning":
-        return "🧠 Размышление", item.get("text", item.get("summary", "")), []
+        return "🧠 Размышление", protocol_text(
+            item.get("text", item.get("summary", ""))
+        ), []
     if item_type == "command_execution":
         command = item.get("command") or item.get("commandLine") or ""
         exit_code = item.get("exit_code")
@@ -511,7 +533,7 @@ def normalize_app_item(item):
     result["type"] = type_map.get(result.get("type"), result.get("type", "unknown"))
     if result["type"] == "reasoning":
         summary = result.get("summary") or result.get("content") or []
-        result["text"] = "\n".join(summary) if isinstance(summary, list) else str(summary)
+        result["text"] = protocol_text(summary)
     result["aggregated_output"] = result.get("aggregatedOutput")
     result["exit_code"] = result.get("exitCode")
     if result["type"] == "file_change":
@@ -564,6 +586,8 @@ def usage_limit_exceeded_message(runtime=None):
 
 def render_process_item(item):
     label, content, results = item_label_and_blocks(item)
+    if item.get("type") in ("reasoning", "agent_message") and not str(content).strip():
+        return ""
     lines = [f"{label}:", mdv2_code_block(content)]
     for result_label, result_content in results:
         lines.extend((f"{result_label}:", mdv2_code_block(result_content)))
@@ -628,14 +652,51 @@ class TurnView:
         self.items = []
         self.process_items = []
         self.draft_thought = None
+        self.draft_thought_id = None
         self.draft_tool = None
-        self.draft_id = int(time.time_ns() % 2147483647) or 1
         self.last_edit_at = 0.0
         self.usage = None
         self.completed = False
-        self.spinner_i = 0
         self.context_notice = None
         self.draft_paused = False
+        # Live progress is a real Telegram message, edited in place.  This
+        # mirrors the Claude bridge and avoids native drafts disappearing or
+        # occupying the composer after /steer.
+        self.progress_msg_id = None
+        self.progress_attempted = False
+        self.progress_lock = threading.Lock()
+
+    @staticmethod
+    def _thought_id(item):
+        return item.get("id") or item.get("itemId") or item.get("item_id")
+
+    def _set_thought(self, item):
+        text = protocol_text(item.get("text", item.get("summary", "")))
+        if not text.strip():
+            return False
+        self.draft_thought = text
+        self.draft_thought_id = self._thought_id(item)
+        # A new thought starts the next model phase.  Until this point the
+        # previous thought remains visible while a following tool runs.
+        self.draft_tool = None
+        return True
+
+    def add_thought_delta(self, delta, item_id=None):
+        delta = protocol_text(delta)
+        if not delta:
+            return
+        # App Server normally supplies itemId.  If an older server omits it,
+        # the presence of a tool is enough to identify this as the next
+        # thought phase.  Subsequent deltas then append to the same thought.
+        if item_id and item_id != self.draft_thought_id:
+            self.draft_thought = ""
+            self.draft_tool = None
+            self.draft_thought_id = item_id
+        elif self.draft_tool is not None:
+            self.draft_thought = ""
+            self.draft_tool = None
+            self.draft_thought_id = item_id
+        self.draft_thought = (self.draft_thought or "") + delta
 
     def add_event(self, event):
         event_type = event.get("type", "unknown")
@@ -650,9 +711,7 @@ class TurnView:
             if isinstance(item, dict):
                 item_type = item.get("type")
                 if item_type in ("agent_message", "reasoning"):
-                    text = item.get("text", item.get("summary", ""))
-                    if text:
-                        self.draft_thought = text
+                    self._set_thought(item)
                 else:
                     self.draft_tool = item
         elif event_type == "item.completed":
@@ -661,7 +720,7 @@ class TurnView:
                 self.items.append(item)
                 item_type = item.get("type")
                 if item_type in ("agent_message", "reasoning"):
-                    self.draft_thought = item.get("text", item.get("summary", ""))
+                    self._set_thought(item)
                 else:
                     self.draft_tool = item
                 self.process_items.append(item)
@@ -674,10 +733,7 @@ class TurnView:
     def live_text(self):
         lines = []
         if self.draft_thought:
-            # Claude uses a neutral writing/thought line while a response is
-            # forming.  The spinner is the only activity indicator; don't
-            # inject a second, abrupt 🤔 marker into the body.
-            lines.append(escape_mdv2(f"✍️ {self.draft_thought}"))
+            lines.append(escape_mdv2(self.draft_thought))
         if self.draft_tool:
             label, content, results = item_label_and_blocks(self.draft_tool)
             lines.append(escape_mdv2(f"{label}:"))
@@ -687,18 +743,48 @@ class TurnView:
                 lines.extend((escape_mdv2(f"{result_label}:"),
                               mdv2_code_block(result_content)))
         body = "\n".join(lines) if lines else "Думаю"
-        return body  # Telegram animates native drafts itself
+        return f"🤔 {body}"
 
-    def _send_live_draft(self, text):
-        result = tg_call("sendMessageDraft", {
-            "chat_id": self.chat_id, "draft_id": self.draft_id,
-            "text": text, "parse_mode": "MarkdownV2",
-        })
-        if not result.get("ok") and not _rate_limited(result):
-            tg_call("sendMessageDraft", {
-                "chat_id": self.chat_id, "draft_id": self.draft_id,
-                "text": strip_mdv2(text).replace("```", ""),
-            })
+    def _send_or_edit_live(self, text, force=False):
+        with self.progress_lock:
+            now = time.monotonic()
+            if (
+                self.progress_msg_id is not None
+                and not force
+                and now - self.last_edit_at < EDIT_THROTTLE_S
+            ):
+                return
+            if self.progress_msg_id is None:
+                if self.progress_attempted:
+                    return
+                self.progress_attempted = True
+                result = tg_call("sendMessage", {
+                    "chat_id": self.chat_id,
+                    "text": text,
+                    "parse_mode": "MarkdownV2",
+                })
+                if not result.get("ok") and not _rate_limited(result):
+                    result = tg_call("sendMessage", {
+                        "chat_id": self.chat_id,
+                        "text": strip_mdv2(text).replace("```", ""),
+                    })
+                if result.get("ok"):
+                    self.progress_msg_id = (result.get("result") or {}).get("message_id")
+            else:
+                params = {
+                    "chat_id": self.chat_id,
+                    "message_id": self.progress_msg_id,
+                    "text": text,
+                    "parse_mode": "MarkdownV2",
+                }
+                result = tg_call("editMessageText", params)
+                if not result.get("ok"):
+                    description = str(result.get("description", "")).lower()
+                    if "not modified" not in description and not _rate_limited(result):
+                        params["text"] = strip_mdv2(text).replace("```", "")
+                        params.pop("parse_mode", None)
+                        tg_call("editMessageText", params)
+            self.last_edit_at = now
 
     def flush(self, force=False):
         if self.draft_paused:
@@ -706,15 +792,34 @@ class TurnView:
         now = time.monotonic()
         if not force and now - self.last_edit_at < EDIT_THROTTLE_S:
             return
-        self.last_edit_at = now
-        self._send_live_draft(truncate_mdv2(self.live_text()))
+        try:
+            self._send_or_edit_live(truncate_mdv2(self.live_text()), force=force)
+        except Exception as exc:
+            # A Telegram hiccup must never stop App Server event consumption.
+            log(f"Live progress update failed: {exc}")
+
+    def resume(self):
+        """Resume live updates after the follow-up message used by /steer."""
+        self.draft_paused = False
+        self.flush(force=True)
+
+    def replace_progress(self, text):
+        """Replace the live message in place, returning whether it succeeded."""
+        with self.progress_lock:
+            if self.progress_msg_id is None:
+                return False
+            result = edit_rich(self.chat_id, self.progress_msg_id, text)
+            return bool(result and result.get("ok"))
 
     def deliver(self, stopped=False, error=None):
         final_index = next(
             (i for i in range(len(self.items) - 1, -1, -1)
              if self.items[i].get("type") == "agent_message"), None
         )
-        final_text = self.items[final_index].get("text", "") if final_index is not None else ""
+        final_text = (
+            protocol_text(self.items[final_index].get("text", ""))
+            if final_index is not None else ""
+        )
 
         process_items = list(self.process_items)
         if final_index is not None:
@@ -736,7 +841,13 @@ class TurnView:
             answer += f"\n\n{self.context_notice}"
 
         if process_items:
-            process_steps = [render_process_item(item) for item in process_items]
+            process_steps = [
+                step for step in (render_process_item(item) for item in process_items)
+                if step
+            ]
+        else:
+            process_steps = []
+        if process_steps:
             closing_reserve = 100
             visible = []
             used = 0
@@ -752,8 +863,12 @@ class TurnView:
                 visible.insert(0, f"…и ещё {hidden} шагов выше…")
             body = "\n".join(visible)
             rich = f"<details><summary>🔧 Процесс ({len(process_steps)})</summary>\n{body}\n</details>"
-            send_rich(self.chat_id, rich)
+            if not self.replace_progress(rich):
+                send_rich(self.chat_id, rich)
             send_rich(self.chat_id, answer)
+        elif self.progress_msg_id is not None:
+            if not self.replace_progress(answer):
+                send_rich(self.chat_id, answer)
         else:
             send_rich(self.chat_id, answer)
 
@@ -821,17 +936,24 @@ def handle_app_notification(runtime, method, params):
             runtime.active_thread_id = params["threadId"]
 
     force = False
-    if method in ("item/started", "item/completed"):
+    if method in ("item/started", "item/updated", "item/completed"):
         item = normalize_app_item(params.get("item"))
         # User messages and internal hook prompts are protocol bookkeeping,
         # not model actions. Rendering them exposed raw JSON after turn/steer.
         if item.get("type") not in ("userMessage", "hookPrompt"):
-            event_type = "item.started" if method.endswith("started") else "item.completed"
+            event_type = {
+                "item/started": "item.started",
+                "item/updated": "item.updated",
+                "item/completed": "item.completed",
+            }[method]
             view.add_event({"type": event_type, "item": item})
             if item.get("type") == "context_compaction" and method.endswith("completed"):
                 view.context_notice = "🗜 Контекст сессии автоматически сжат."
     elif method == "item/agentMessage/delta":
-        view.draft_thought = (view.draft_thought or "") + str(params.get("delta", ""))
+        view.add_thought_delta(
+            params.get("delta", ""),
+            params.get("itemId") or params.get("item_id") or params.get("id"),
+        )
     elif method == "thread/tokenUsage/updated":
         token_usage = params.get("tokenUsage") or {}
         view.usage = _usage_for_renderer(token_usage)
@@ -1112,12 +1234,18 @@ def run_compaction(runtime, thread_id):
         with process_lock:
             error = error or runtime.active_error
         if error:
-            send_plain(chat_id, f"🗜 Не удалось сжать контекст: {error}")
+            message = f"🗜 Не удалось сжать контекст: {error}"
+            if not view.replace_progress(message):
+                send_plain(chat_id, message)
         else:
             update_state(chat_id, last_usage=None, session_usage=None, context_window=None)
-            send_plain(chat_id, "🗜 Контекст сессии сжат. Можно продолжать.")
+            message = "🗜 Контекст сессии сжат. Можно продолжать."
+            if not view.replace_progress(message):
+                send_plain(chat_id, message)
     except Exception as exc:
-        send_plain(chat_id, f"🗜 Не удалось сжать контекст: {user_facing_codex_error(exc)}")
+        message = f"🗜 Не удалось сжать контекст: {user_facing_codex_error(exc)}"
+        if not view.replace_progress(message):
+            send_plain(chat_id, message)
     finally:
         with process_lock:
             runtime.active_view = None
@@ -1533,10 +1661,10 @@ def handle_command(chat_id, command):
         return True
     if cmd == "steer":
         if pause_active_draft(runtime):
-            # A regular message dismisses Telegram's native composer draft.
-            # The view remains paused so the next progress event cannot seize
-            # the input field again before the owner finishes typing.
-            send_plain(chat_id, "✍️ Draft приостановлен. Пиши дополнение — оно войдёт в текущий ход.")
+            # Keep the progress message frozen while the owner composes the
+            # follow-up; handle_message() resumes it after turn/steer accepts
+            # that message.
+            send_plain(chat_id, "✍️ Прогресс приостановлен. Пиши дополнение — оно войдёт в текущий ход.")
         else:
             send_plain(chat_id, "Сейчас нет активного хода; просто отправь обычное сообщение.")
         return True
@@ -1673,7 +1801,16 @@ def handle_message(message):
             already_busy = False
     if already_busy:
         steered, error = steer_current_turn(runtime, inputs, media_paths)
-        if not steered:
+        if steered:
+            # /steer temporarily pauses the live progress message so the
+            # owner can type.  Once the follow-up is accepted, immediately
+            # resume editing the same message instead of leaving the draft
+            # permanently frozen for the rest of the turn.
+            with process_lock:
+                view = runtime.active_view
+            if view is not None:
+                view.resume()
+        else:
             for path in media_paths:
                 try:
                     os.unlink(path)

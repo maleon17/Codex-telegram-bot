@@ -6,12 +6,12 @@ metered OpenAI API key is required.
 
 Unlike wrappers that launch `codex exec` for every message, this bridge keeps
 one `codex app-server` alive per Telegram user. Threads survive restarts,
-events stream into Telegram native drafts, and a follow-up can be injected
-into a running turn with App Server's `turn/steer`.
+events stream into one persistent Telegram progress message, and a follow-up
+can be injected into a running turn with App Server's `turn/steer`.
 
 ## Features
 
-- Native Telegram draft animation with live reasoning/tool progress.
+- One editable `🤔` progress message with live reasoning, tool calls and results.
 - Persistent Codex threads: `/new`, `/sessions`, `/resume`.
 - Mid-turn input: select `/steer`, then send a follow-up message.
 - Clean cancellation through `turn/interrupt` (`/stop`).
@@ -92,7 +92,7 @@ journalctl -u codex-telegram-bot -f
 | `/resume <id>` | Resume by full ID or unique prefix |
 | `/status` | Thread, account, model, sandbox, workspace and busy state |
 | `/stop` | Interrupt the active turn |
-| `/steer` | Pause the native draft and free the input field for a mid-turn follow-up |
+| `/steer` | Pause progress while composing a mid-turn follow-up |
 | `/compact` | Compact the current thread context |
 | `/usage` | Session tokens, context and account rate limits |
 | `/model [id]` | Show available models or select one by its real ID |
@@ -105,10 +105,9 @@ journalctl -u codex-telegram-bot -f
 
 ### Why `/steer` exists
 
-Telegram's native `sendMessageDraft` occupies the client's composer, so the
-client cannot simultaneously display that animation and let you type. Select
-`/steer` from the command menu: the bot dismisses and pauses the draft for the
-rest of that turn; your next ordinary message is appended to the active turn.
+Select `/steer` from the command menu to pause progress while you compose a
+follow-up. The next ordinary message is appended to the active turn, and the
+same progress message resumes updating immediately.
 
 ## Multi-account setup
 
@@ -187,8 +186,8 @@ The restart watcher sends one status message and edits that same message to
 - **Owner is unauthorized:** run `codex login status` as the service user.
 - **Additional user cannot run Codex:** use `/account`, then `/login`. Check
   that `accounts/<id>/` is writable by the service user.
-- **Draft blocks typing:** select `/steer`; this is a Telegram native-draft
-  limitation, not an App Server limitation.
+- **Need to type during a turn:** select `/steer`; progress pauses until the
+  follow-up is accepted, then resumes on the same message.
 - **No code formatting in an old draft screenshot:** current versions balance
   and escape MarkdownV2 pre blocks. Check the journal for fresh Bot API 400s.
 - **Sandbox warning about bubblewrap:** Codex can use its bundled bubblewrap;

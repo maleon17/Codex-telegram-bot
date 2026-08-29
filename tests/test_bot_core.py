@@ -58,6 +58,86 @@ class RenderingTests(unittest.TestCase):
         self.assertLessEqual(len(rendered), 100)
         self.assertEqual(rendered.count("```") % 2, 0)
 
+    def test_live_progress_keeps_thought_until_next_thought(self):
+        view = bot.TurnView(1)
+        view.add_event({"type": "item.completed", "item": {
+            "type": "reasoning", "id": "reason-1", "text": "Сначала проверю файл",
+        }})
+        view.add_event({"type": "item.started", "item": {
+            "type": "command_execution", "id": "tool-1", "command": "printf one",
+        }})
+        view.add_event({"type": "item.completed", "item": {
+            "type": "command_execution", "id": "tool-1", "command": "printf one",
+            "aggregated_output": "one", "exit_code": 0,
+        }})
+        text = view.live_text()
+        self.assertLess(text.index("Сначала проверю файл"), text.index("🔧 Bash"))
+        self.assertLess(text.index("🔧 Bash"), text.index("one"))
+
+        view.add_event({"type": "item.started", "item": {
+            "type": "command_execution", "id": "tool-2", "command": "printf two",
+        }})
+        text = view.live_text()
+        self.assertIn("Сначала проверю файл", text)
+        self.assertIn("printf two", text)
+        self.assertNotIn("one", text)
+
+        view.add_thought_delta("Теперь отвечу", item_id="reason-2")
+        text = view.live_text()
+        self.assertIn("Теперь отвечу", text)
+        self.assertNotIn("Сначала проверю файл", text)
+        self.assertNotIn("printf two", text)
+
+    def test_live_progress_is_one_persistent_message(self):
+        calls = []
+        original_tg_call = bot.tg_call
+
+        def fake_tg_call(method, params=None, timeout=bot.HTTP_TIMEOUT_S):
+            calls.append((method, params or {}))
+            if method == "sendMessage":
+                return {"ok": True, "result": {"message_id": 42}}
+            return {"ok": True, "result": {}}
+
+        bot.tg_call = fake_tg_call
+        try:
+            view = bot.TurnView(1)
+            view.flush(force=True)
+            view.draft_thought = "Мысль"
+            view.flush(force=True)
+        finally:
+            bot.tg_call = original_tg_call
+
+        self.assertEqual([method for method, _ in calls], ["sendMessage", "editMessageText"])
+        self.assertNotIn("sendMessageDraft", [method for method, _ in calls])
+        self.assertIn("🤔", calls[0][1]["text"])
+        self.assertIn("Мысль", calls[1][1]["text"])
+
+    def test_steer_resume_unpauses_the_same_progress_message(self):
+        calls = []
+        original_tg_call = bot.tg_call
+
+        def fake_tg_call(method, params=None, timeout=bot.HTTP_TIMEOUT_S):
+            calls.append((method, params or {}))
+            if method == "sendMessage":
+                return {"ok": True, "result": {"message_id": 43}}
+            return {"ok": True, "result": {}}
+
+        bot.tg_call = fake_tg_call
+        try:
+            view = bot.TurnView(1)
+            view.draft_paused = True
+            view.flush(force=True)
+            self.assertEqual(calls, [])
+            view.resume()
+        finally:
+            bot.tg_call = original_tg_call
+
+        self.assertEqual([method for method, _ in calls], ["sendMessage"])
+        self.assertFalse(view.draft_paused)
+
+    def test_empty_reasoning_is_not_rendered_as_a_blank_step(self):
+        self.assertEqual(bot.render_process_item({"type": "reasoning", "summary": []}), "")
+
     def test_usage_limit_has_actionable_message(self):
         message = bot.user_facing_codex_error({
             "message": "usage limit reached",
