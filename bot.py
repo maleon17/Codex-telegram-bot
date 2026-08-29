@@ -747,17 +747,7 @@ class TurnView:
 def get_app_server(runtime):
     with process_lock:
         if runtime.app_server is None:
-            # The shared telegram_actions MCP server is configured once in
-            # Codex's config.toml.  Per-turn context cannot be kept there:
-            # every Telegram user must identify their own originating chat
-            # while still using the single userbot trigger store.  Dedicated
-            # CODEX_TELEGRAM_* variables avoid colliding with the legacy
-            # CHAT_ID/INSTANCE_ID values in older Claude deployments.
             env = dict(os.environ)
-            env["CODEX_TELEGRAM_CHAT_ID"] = str(runtime.chat_id)
-            env["CODEX_TELEGRAM_INSTANCE_ID"] = os.environ.get(
-                "CODEX_TELEGRAM_INSTANCE_ID", "andrey"
-            )
             codex_home = tenant_codex_home(runtime.chat_id)
             if codex_home is not None:
                 env["CODEX_HOME"] = str(codex_home)

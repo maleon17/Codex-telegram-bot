@@ -67,7 +67,6 @@ journalctl -u codex-telegram-bot -f
    OWNER_ID=123456789
    CODEX_CWD=/home/your-user
    CODEX_SANDBOX=danger-full-access
-   CODEX_TELEGRAM_INSTANCE_ID=andrey
    CODEX_BOT_STATE_FILE=/absolute/path/Codex-telegram-bot/state.json
    CODEX_BOT_WHITELIST_FILE=/absolute/path/Codex-telegram-bot/whitelist.txt
    CODEX_BOT_ACCOUNTS_DIR=/absolute/path/Codex-telegram-bot/accounts
@@ -134,40 +133,16 @@ Removing an ID from `whitelist.txt` blocks new messages immediately. Existing
 credentials remain on disk; remove `accounts/<id>/` separately only if you
 intend to revoke and delete that local account state.
 
-## Shared Telegram tools and triggers
+## Product boundary
 
-Claude and Codex intentionally use one trigger engine. The engine runs in the
-Telethon userbot (`ClaudeAsk`), where it can see incoming messages in your real
-Telegram chats. Both assistants reach it through the same `telegram_actions`
-MCP server and the userbot's command queue; there is no second Codex-only
-trigger database to drift out of sync.
+This repository is only the standalone Telegram Bot API frontend for Codex.
+Jarvis, the Telethon userbot module, Telegram-account actions and triggers live
+in the separate `/home/mishin/codex-jarvis` product. The two applications do
+not import one another and have independent sessions and runtime processes.
 
-The Codex App Server must have that MCP server in the Linux user's
-`~/.codex/config.toml` (the existing Claude deployment already provides it):
-
-See [codex-config.toml.example](codex-config.toml.example) for a copyable
-configuration block.
-
-```toml
-[mcp_servers.telegram_actions]
-command = "/absolute/path/to/mcp-venv/bin/python3"
-args = ["/absolute/path/to/Codex-telegram-bot/telegram_actions_mcp.py"]
-startup_timeout_sec = 20.0
-tool_timeout_sec = 40.0
-default_tools_approval_mode = "auto"
-```
-
-Create the optional MCP environment with `python3 -m venv /absolute/path/to/mcp-venv`
-and `.../bin/pip install -r requirements-mcp.txt`. The regular bot does not
-need this package unless Telegram actions/triggers are enabled.
-
-Keep the remote userbot and its `cmd_queue.py` running. Codex supplies the
-current Telegram chat through process-local `CODEX_TELEGRAM_CHAT_ID` and
-`CODEX_TELEGRAM_INSTANCE_ID` variables, so a multi-account Codex user cannot
-silently inherit the owner's origin chat. The shared MCP exposes
-`register_trigger`, `edit_trigger`, `remove_trigger` and `list_triggers` along
-with the other Telegram actions. Ask Codex to create a rule in plain language;
-it will call the same backend Claude uses.
+The only shared piece is the small local command queue used to relay actions;
+it is transport infrastructure, not part of this bot's model or Telegram
+interface.
 
 ## Runtime files and backup
 

@@ -69,7 +69,6 @@ umask 077
     printf 'OWNER_ID=%s\n' "$OWNER_ID"
     printf 'CODEX_CWD=%s\n' "$CODEX_CWD"
     printf 'CODEX_SANDBOX=%s\n' "$CODEX_SANDBOX"
-    printf 'CODEX_TELEGRAM_INSTANCE_ID=%s\n' "${CODEX_TELEGRAM_INSTANCE_ID:-andrey}"
     printf 'CODEX_BOT_STATE_FILE=%s/state.json\n' "$INSTALL_DIR"
     printf 'CODEX_BOT_WHITELIST_FILE=%s/whitelist.txt\n' "$INSTALL_DIR"
     printf 'CODEX_BOT_ACCOUNTS_DIR=%s/accounts\n' "$INSTALL_DIR"
