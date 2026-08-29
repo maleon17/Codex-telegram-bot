@@ -79,6 +79,7 @@ active_thread_id = None
 active_error = None
 active_stopped = False
 active_last_event_at = None
+active_media_paths = []
 restart_draining = False
 
 
@@ -146,6 +147,61 @@ def tg_call(method, params=None, timeout=HTTP_TIMEOUT_S):
     return result
 
 
+def download_telegram_file(file_id, suggested_name="image.jpg"):
+    """Download an owner-sent Telegram file for App Server localImage input."""
+    result = tg_call("getFile", {"file_id": file_id})
+    remote_path = (result.get("result") or {}).get("file_path") if result.get("ok") else None
+    if not remote_path:
+        raise RuntimeError("Telegram не вернул путь к файлу")
+    suffix = Path(suggested_name).suffix or Path(remote_path).suffix or ".jpg"
+    media_dir = Path(tempfile.gettempdir()) / "codex-telegram-bot-media"
+    media_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, local_path = tempfile.mkstemp(prefix="upload-", suffix=suffix, dir=media_dir)
+    try:
+        with urllib.request.urlopen(
+            f"https://api.telegram.org/file/bot{BOT_TOKEN}/{remote_path}",
+            timeout=HTTP_TIMEOUT_S,
+        ) as response, os.fdopen(fd, "wb") as handle:
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                handle.write(chunk)
+        return local_path
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(local_path)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def message_inputs(message):
+    """Build App Server inputs from Telegram text/caption and image media."""
+    text = message.get("text") or message.get("caption") or ""
+    inputs = []
+    paths = []
+    if isinstance(text, str) and text.strip():
+        inputs.append({"type": "text", "text": text.strip()})
+    photo = message.get("photo")
+    if isinstance(photo, list) and photo:
+        path = download_telegram_file(photo[-1]["file_id"], "photo.jpg")
+        paths.append(path)
+        inputs.append({"type": "localImage", "path": path})
+    document = message.get("document") or {}
+    if str(document.get("mime_type", "")).startswith("image/") and document.get("file_id"):
+        path = download_telegram_file(document["file_id"], document.get("file_name") or "image")
+        paths.append(path)
+        inputs.append({"type": "localImage", "path": path})
+    if paths and not any(item.get("type") == "text" for item in inputs):
+        inputs.insert(0, {"type": "text", "text": "Посмотри на это изображение и ответь по контексту."})
+    return inputs, paths
+
+
 def load_state():
     if not STATE_FILE.exists():
         return {"thread_id": None, "model": None, "sandbox": CODEX_SANDBOX,
@@ -201,6 +257,22 @@ def compact(value, limit=1000):
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
+def mdv2_code_block(value):
+    """Render safe MarkdownV2 pre content (backslash/backtick are special)."""
+    content = str(value).replace("\\", "\\\\").replace("`", "\\`")
+    return f"```\n{content}\n```"
+
+
+def truncate_mdv2(text, limit=MAX_MESSAGE_LEN):
+    """Truncate without ever leaving a Telegram MarkdownV2 pre block open."""
+    if len(text) <= limit:
+        return text
+    clipped = text[:limit]
+    if clipped.count("```") % 2:
+        clipped = clipped[: max(0, limit - 4)].rstrip() + "\n```"
+    return clipped
+
+
 def item_label_and_blocks(item):
     item_type = item.get("type", "unknown")
     if item_type == "agent_message":
@@ -253,9 +325,9 @@ def normalize_app_item(item):
 
 def render_process_item(item):
     label, content, results = item_label_and_blocks(item)
-    lines = [f"{label}:", f"```\n{content}\n```"]
+    lines = [f"{label}:", mdv2_code_block(content)]
     for result_label, result_content in results:
-        lines.extend((f"{result_label}:", f"```\n{result_content}\n```"))
+        lines.extend((f"{result_label}:", mdv2_code_block(result_content)))
     return "\n".join(lines)
 
 
@@ -364,10 +436,10 @@ class TurnView:
             lines.append(escape_mdv2(str(self.draft_thought)))
         if self.draft_tool:
             label, content, results = item_label_and_blocks(self.draft_tool)
-            lines.extend((escape_mdv2(f"{label}:"), f"```\n{content}\n```"))
+            lines.extend((escape_mdv2(f"{label}:"), mdv2_code_block(content)))
             for result_label, result_content in results:
                 lines.extend((escape_mdv2(f"{result_label}:"),
-                              f"```\n{result_content}\n```"))
+                              mdv2_code_block(result_content)))
         body = "\n".join(lines) if lines else "Думаю"
         return body  # Telegram animates native drafts itself
 
@@ -387,7 +459,7 @@ class TurnView:
         if not force and now - self.last_edit_at < EDIT_THROTTLE_S:
             return
         self.last_edit_at = now
-        self._send_live_draft(self.live_text()[:MAX_MESSAGE_LEN])
+        self._send_live_draft(truncate_mdv2(self.live_text()))
 
     def deliver(self, stopped=False, error=None):
         final_index = next(
@@ -544,9 +616,9 @@ def sandbox_policy(name, workspace):
     return {"type": "dangerFullAccess"}
 
 
-def run_turn(chat_id, prompt, thread_id):
+def run_turn(chat_id, inputs, thread_id, media_paths=None):
     global busy, active_view, active_done, active_turn_id, active_thread_id
-    global active_error, active_stopped, active_last_event_at
+    global active_error, active_stopped, active_last_event_at, active_media_paths
     view = TurnView(chat_id)
     done = threading.Event()
     error = None
@@ -565,10 +637,11 @@ def run_turn(chat_id, prompt, thread_id):
             active_error = None
             active_stopped = False
             active_last_event_at = time.monotonic()
+            active_media_paths = list(media_paths or [])
         view.flush(force=True)
         params = {
             "threadId": server_thread_id,
-            "input": [{"type": "text", "text": prompt}],
+            "input": inputs,
             "cwd": snapshot.get("workspace") or CODEX_CWD,
             "approvalPolicy": "never",
             "sandboxPolicy": sandbox_policy(
@@ -611,7 +684,14 @@ def run_turn(chat_id, prompt, thread_id):
             active_error = None
             active_stopped = False
             active_last_event_at = None
+            paths = active_media_paths
+            active_media_paths = []
             busy = False
+        for path in paths:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
 
 
 def session_files():
@@ -703,21 +783,29 @@ def stop_current_process():
         return False
 
 
-def steer_current_turn(text):
+def steer_current_turn(inputs, media_paths=None):
+    global active_media_paths
     with process_lock:
         client = app_server
         thread_id = active_thread_id
         turn_id = active_turn_id
         if client is None or not thread_id or not turn_id:
             return False, "активный ход ещё не успел получить ID — повтори через секунду"
+        active_media_paths.extend(media_paths or [])
     try:
         client.request("turn/steer", {
             "threadId": thread_id,
             "expectedTurnId": turn_id,
-            "input": [{"type": "text", "text": text}],
+            "input": inputs,
         })
         return True, None
     except Exception as exc:
+        with process_lock:
+            for path in media_paths or []:
+                try:
+                    active_media_paths.remove(path)
+                except ValueError:
+                    pass
         return False, compact(str(exc), 500)
 
 
@@ -816,8 +904,11 @@ def handle_message(message):
     chat_id = message.get("chat", {}).get("id")
     if chat_id != OWNER_ID:
         return
-    text = message.get("text")
-    if not isinstance(text, str) or not text.strip():
+    text = message.get("text") or message.get("caption") or ""
+    has_image = bool(message.get("photo")) or str(
+        (message.get("document") or {}).get("mime_type", "")
+    ).startswith("image/")
+    if (not isinstance(text, str) or not text.strip()) and not has_image:
         return
     text = text.strip()
     with process_lock:
@@ -828,6 +919,11 @@ def handle_message(message):
     if text.startswith(("/", ".")):
         handle_command(chat_id, text)
         return
+    try:
+        inputs, media_paths = message_inputs(message)
+    except Exception as exc:
+        send_plain(chat_id, f"Не смог скачать изображение: {compact(str(exc), 500)}")
+        return
     with process_lock:
         if busy:
             already_busy = True
@@ -835,15 +931,22 @@ def handle_message(message):
             busy = True
             already_busy = False
     if already_busy:
-        steered, error = steer_current_turn(text)
+        steered, error = steer_current_turn(inputs, media_paths)
         if steered:
             send_plain(chat_id, "↪️ Добавил сообщение в текущий ход Codex.")
         else:
+            for path in media_paths:
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
             send_plain(chat_id, f"Не получилось добавить в текущий ход: {error}")
         return
     with state_lock:
         thread_id = state.get("thread_id")
-    threading.Thread(target=run_turn, args=(chat_id, text, thread_id), daemon=True).start()
+    threading.Thread(
+        target=run_turn, args=(chat_id, inputs, thread_id, media_paths), daemon=True
+    ).start()
 
 
 def register_commands():
