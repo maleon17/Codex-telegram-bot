@@ -874,7 +874,8 @@ def handle_app_notification(runtime, method, params):
     if method in ("item/started", "item/updated", "item/completed"):
         item = normalize_app_item(params.get("item"))
         # User messages and internal hook prompts are protocol bookkeeping,
-        # not model actions. Rendering them exposed raw JSON after turn/steer.
+        # not model actions. Rendering them exposed raw JSON after a mid-turn
+        # message was injected.
         if item.get("type") not in ("userMessage", "hookPrompt"):
             event_type = {
                 "item/started": "item.started",
