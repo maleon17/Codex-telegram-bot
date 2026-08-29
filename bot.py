@@ -30,7 +30,9 @@ COMMANDS = [
     ("resume", "Продолжить сессию по id"),
     ("status", "Сессия, модель, sandbox и workspace"),
     ("stop", "Прервать текущий запрос"),
+    ("steer", "Освободить ввод и дополнить текущий ход"),
     ("usage", "Токены последнего запроса"),
+    ("compact", "Сжать контекст текущей сессии"),
     ("model", "Выбрать модель Codex"),
     ("mode", "Sandbox: read-only/workspace-write/full"),
     ("workspace", "Рабочая директория"),
@@ -82,6 +84,7 @@ active_stopped = False
 active_last_event_at = None
 active_media_paths = []
 restart_draining = False
+last_rate_limits = None
 
 
 def _rate_limited(result):
@@ -317,6 +320,7 @@ def normalize_app_item(item):
         "webSearch": "web_search",
         "imageView": "image_view",
         "collabAgentToolCall": "collab_agent_tool_call",
+        "contextCompaction": "context_compaction",
     }
     result["type"] = type_map.get(result.get("type"), result.get("type", "unknown"))
     if result["type"] == "reasoning":
@@ -327,6 +331,49 @@ def normalize_app_item(item):
     if result["type"] == "file_change":
         result["changes"] = result.get("changes", [])
     return result
+
+
+def user_facing_codex_error(error):
+    if not isinstance(error, dict):
+        text = str(error)
+        info = None
+    else:
+        text = str(error.get("message") or "Неизвестная ошибка Codex")
+        info = error.get("codexErrorInfo")
+    combined = f"{info or ''} {text}".lower()
+    if "contextwindowexceeded" in combined or "context window" in combined:
+        return (
+            "Контекст текущей сессии исчерпан. Используй /compact, чтобы сжать "
+            "историю и продолжить, либо /new для новой сессии."
+        )
+    if "sessionbudgetexceeded" in combined:
+        return "Бюджет этой сессии исчерпан. Начни новую через /new."
+    if "usagelimitexceeded" in combined:
+        return usage_limit_exceeded_message()
+    return compact(text, 1000)
+
+
+def usage_limit_exceeded_message():
+    with process_lock:
+        limits = dict(last_rate_limits or {})
+    windows = [
+        ("5-часовой лимит", limits.get("primary")),
+        ("недельный лимит", limits.get("secondary")),
+    ]
+    reached = [(label, window) for label, window in windows
+               if isinstance(window, dict) and int(window.get("usedPercent") or 0) >= 100]
+    if not reached:
+        available = [(label, window) for label, window in windows if isinstance(window, dict)]
+        reached = sorted(
+            available, key=lambda pair: int(pair[1].get("usedPercent") or 0), reverse=True
+        )[:1]
+    if not reached:
+        return "Лимит сессии Codex исчерпан. Попробуй позже; актуальное состояние — /usage."
+    details = "; ".join(
+        f"{label}, сброс {format_reset_time(window.get('resetsAt'))}"
+        for label, window in reached
+    )
+    return f"⏳ Лимит сессии Codex исчерпан: {details}. После сброса можно продолжить этот же тред."
 
 
 def render_process_item(item):
@@ -401,6 +448,8 @@ class TurnView:
         self.usage = None
         self.completed = False
         self.spinner_i = 0
+        self.context_notice = None
+        self.draft_paused = False
 
     def add_event(self, event):
         event_type = event.get("type", "unknown")
@@ -461,6 +510,8 @@ class TurnView:
             })
 
     def flush(self, force=False):
+        if self.draft_paused:
+            return
         now = time.monotonic()
         if not force and now - self.last_edit_at < EDIT_THROTTLE_S:
             return
@@ -490,6 +541,8 @@ class TurnView:
             answer = final_text or "(нет ответа — смотри процесс выше)"
         if self.usage is not None:
             answer += f"\n\nТокены: {format_usage(self.usage)}"
+        if self.context_notice:
+            answer += f"\n\n{self.context_notice}"
 
         if process_items:
             process_steps = [render_process_item(item) for item in process_items]
@@ -539,6 +592,16 @@ def _usage_for_renderer(token_usage):
 
 def handle_app_notification(method, params):
     global active_turn_id, active_thread_id, active_error, active_last_event_at
+    global last_rate_limits
+    if method == "account/rateLimits/updated":
+        update = params.get("rateLimits") or {}
+        with process_lock:
+            merged = dict(last_rate_limits or {})
+            for key, value in update.items():
+                if value is not None:
+                    merged[key] = value
+            last_rate_limits = merged
+        return
     with process_lock:
         view = active_view
         done = active_done
@@ -556,13 +619,30 @@ def handle_app_notification(method, params):
     force = False
     if method in ("item/started", "item/completed"):
         item = normalize_app_item(params.get("item"))
-        event_type = "item.started" if method.endswith("started") else "item.completed"
-        view.add_event({"type": event_type, "item": item})
+        # User messages and internal hook prompts are protocol bookkeeping,
+        # not model actions. Rendering them exposed raw JSON after turn/steer.
+        if item.get("type") not in ("userMessage", "hookPrompt"):
+            event_type = "item.started" if method.endswith("started") else "item.completed"
+            view.add_event({"type": event_type, "item": item})
+            if item.get("type") == "context_compaction" and method.endswith("completed"):
+                view.context_notice = "🗜 Контекст сессии автоматически сжат."
     elif method == "item/agentMessage/delta":
         view.draft_thought = (view.draft_thought or "") + str(params.get("delta", ""))
     elif method == "thread/tokenUsage/updated":
         token_usage = params.get("tokenUsage") or {}
         view.usage = _usage_for_renderer(token_usage)
+        context_window = token_usage.get("modelContextWindow")
+        context_tokens = view.usage.get("input_tokens") or 0
+        if context_window and context_tokens:
+            ratio = context_tokens / context_window
+            if ratio >= 0.9:
+                view.context_notice = (
+                    f"⚠️ Контекст заполнен на {ratio:.0%}. Рекомендуется /compact или /new."
+                )
+            elif ratio >= 0.8:
+                view.context_notice = (
+                    f"⚠️ Контекст заполнен на {ratio:.0%}; скоро понадобится /compact."
+                )
         update_state(
             last_usage=view.usage,
             session_usage=_usage_breakdown(token_usage.get("total") or {}),
@@ -570,12 +650,17 @@ def handle_app_notification(method, params):
         )
     elif method == "error" and not params.get("willRetry"):
         with process_lock:
-            active_error = compact(params.get("error", "неизвестная ошибка"), 1000)
+            active_error = user_facing_codex_error(params.get("error", "неизвестная ошибка"))
+    elif method == "thread/compacted":
+        view.context_notice = "🗜 Контекст сессии сжат."
+        force = True
+        if done is not None:
+            done.set()
     elif method == "turn/completed":
         turn = params.get("turn") or {}
         if turn.get("error"):
             with process_lock:
-                active_error = compact(turn["error"], 1000)
+                active_error = user_facing_codex_error(turn["error"])
         view.completed = True
         force = True
         if done is not None:
@@ -710,6 +795,50 @@ def run_turn(chat_id, inputs, thread_id, media_paths=None):
                 pass
 
 
+def run_compaction(chat_id, thread_id):
+    global busy, active_view, active_done, active_turn_id, active_thread_id
+    global active_error, active_stopped, active_last_event_at
+    view = TurnView(chat_id)
+    done = threading.Event()
+    error = None
+    try:
+        client = get_app_server()
+        client.start_if_needed()
+        server_thread_id = ensure_thread(client, thread_id)
+        with process_lock:
+            active_view = view
+            active_done = done
+            active_turn_id = None
+            active_thread_id = server_thread_id
+            active_error = None
+            active_stopped = False
+            active_last_event_at = time.monotonic()
+        view.draft_thought = "🗜 Сжимаю контекст сессии…"
+        view.flush(force=True)
+        client.request("thread/compact/start", {"threadId": server_thread_id}, timeout=60)
+        if not done.wait(TOTAL_TIMEOUT_S):
+            error = "Сжатие контекста не завершилось за отведённое время."
+        with process_lock:
+            error = error or active_error
+        if error:
+            send_plain(chat_id, f"🗜 Не удалось сжать контекст: {error}")
+        else:
+            update_state(last_usage=None, session_usage=None, context_window=None)
+            send_plain(chat_id, "🗜 Контекст сессии сжат. Можно продолжать.")
+    except Exception as exc:
+        send_plain(chat_id, f"🗜 Не удалось сжать контекст: {user_facing_codex_error(exc)}")
+    finally:
+        with process_lock:
+            active_view = None
+            active_done = None
+            active_turn_id = None
+            active_thread_id = None
+            active_error = None
+            active_stopped = False
+            active_last_event_at = None
+            busy = False
+
+
 def session_files():
     root = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")) / "sessions"
     return sorted(root.glob("**/*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
@@ -799,6 +928,7 @@ def rate_limit_line(label, window):
 
 
 def build_usage_report():
+    global last_rate_limits
     with state_lock:
         snapshot = dict(state)
     thread_id = snapshot.get("thread_id")
@@ -809,6 +939,8 @@ def build_usage_report():
     limits_error = usage_error = None
     try:
         limits_result = client.request("account/rateLimits/read", timeout=30)
+        with process_lock:
+            last_rate_limits = (limits_result or {}).get("rateLimits") or last_rate_limits
     except Exception as exc:
         limits_error = compact(str(exc), 300)
     try:
@@ -859,6 +991,16 @@ def build_usage_report():
     else:
         lines.append(f"Не удалось получить: {limits_error or 'нет данных'}")
     return "\n".join(lines)
+
+
+def refresh_rate_limits():
+    global last_rate_limits
+    try:
+        result = get_app_server().request("account/rateLimits/read", timeout=30)
+        with process_lock:
+            last_rate_limits = (result or {}).get("rateLimits") or last_rate_limits
+    except Exception as exc:
+        log(f"Could not preload Codex rate limits: {exc}")
 
 
 def request_restart(chat_id):
@@ -951,6 +1093,15 @@ def steer_current_turn(inputs, media_paths=None):
         return False, compact(str(exc), 500)
 
 
+def pause_active_draft():
+    with process_lock:
+        view = active_view
+        if not busy or view is None:
+            return False
+        view.draft_paused = True
+        return True
+
+
 def handle_command(chat_id, command):
     global busy
     raw_cmd, _, arg = command.partition(" ")
@@ -994,6 +1145,34 @@ def handle_command(chat_id, command):
         return True
     if cmd == "usage":
         send_plain(chat_id, build_usage_report())
+        return True
+    if cmd == "compact":
+        with state_lock:
+            thread_id = state.get("thread_id")
+        if not thread_id:
+            send_plain(chat_id, "Нет активной сессии для сжатия.")
+            return True
+        with process_lock:
+            if busy:
+                already_busy = True
+            else:
+                busy = True
+                already_busy = False
+        if already_busy:
+            send_plain(chat_id, "Сначала дождись завершения текущего хода или используй /stop.")
+        else:
+            threading.Thread(
+                target=run_compaction, args=(chat_id, thread_id), daemon=True
+            ).start()
+        return True
+    if cmd == "steer":
+        if pause_active_draft():
+            # A regular message dismisses Telegram's native composer draft.
+            # The view remains paused so the next progress event cannot seize
+            # the input field again before the owner finishes typing.
+            send_plain(chat_id, "✍️ Draft приостановлен. Пиши дополнение — оно войдёт в текущий ход.")
+        else:
+            send_plain(chat_id, "Сейчас нет активного хода; просто отправь обычное сообщение.")
         return True
     if cmd == "model":
         update_state(model=None if arg.lower() in ("", "default") else arg)
@@ -1105,6 +1284,7 @@ def main():
         send_plain(completed_restart_chat_id, "✅ Перезагрузка окончена, бот готов к работе.")
     try:
         get_app_server().start_if_needed()
+        refresh_rate_limits()
         log("Persistent Codex app-server is ready")
     except Exception as exc:
         log(f"Codex app-server warm start failed; will retry on first message: {exc}")
