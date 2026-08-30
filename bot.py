@@ -14,9 +14,10 @@ from datetime import datetime
 from pathlib import Path
 
 from app_server import AppServerClient, AppServerError
-from telegram_format import escape_mdv2
+from telegram_format import escape_mdv2, strip_mdv2
 
 
+EDIT_THROTTLE_S = 1.3
 BATCH_DEBOUNCE_S = 1.5
 MAX_MESSAGE_LEN = 4000
 RICH_MAX_CHARS = 30000
@@ -658,9 +659,16 @@ class TurnView:
         self.current_thought = None
         self.current_thought_id = None
         self.current_tool = None
+        self.last_edit_at = 0.0
         self.usage = None
         self.completed = False
         self.context_notice = None
+        # A real Telegram message is the live process card.  It is edited in
+        # place as App Server events arrive, like the Claude bridge; this is
+        # deliberately not Telegram's ephemeral sendMessageDraft API.
+        self.progress_msg_id = None
+        self.progress_attempted = False
+        self.progress_lock = threading.Lock()
 
     @staticmethod
     def _thought_id(item):
@@ -741,14 +749,69 @@ class TurnView:
         body = "\n".join(lines) if lines else "Думаю"
         return f"🤔 {body}"
 
-    def flush(self, force=False):
-        """Collect events without publishing transient Telegram progress.
+    def _send_or_edit_live(self, text, force=False):
+        """Publish one persistent process message and update it in place."""
+        with self.progress_lock:
+            now = time.monotonic()
+            if (
+                self.progress_msg_id is not None
+                and not force
+                and now - self.last_edit_at < EDIT_THROTTLE_S
+            ):
+                return
+            if self.progress_msg_id is None:
+                # A failed first send must not cause a Telegram request for
+                # every token delta.  A later forced flush can retry once.
+                if self.progress_attempted and not force:
+                    return
+                self.progress_attempted = True
+                result = tg_call("sendMessage", {
+                    "chat_id": self.chat_id,
+                    "text": text,
+                    "parse_mode": "MarkdownV2",
+                })
+                if not result.get("ok") and not _rate_limited(result):
+                    result = tg_call("sendMessage", {
+                        "chat_id": self.chat_id,
+                        "text": strip_mdv2(text).replace("```", ""),
+                    })
+                if result.get("ok"):
+                    self.progress_msg_id = (result.get("result") or {}).get("message_id")
+            else:
+                params = {
+                    "chat_id": self.chat_id,
+                    "message_id": self.progress_msg_id,
+                    "text": text,
+                    "parse_mode": "MarkdownV2",
+                }
+                result = tg_call("editMessageText", params)
+                if not result.get("ok"):
+                    description = str(result.get("description", "")).lower()
+                    if "not modified" not in description and not _rate_limited(result):
+                        params["text"] = strip_mdv2(text).replace("```", "")
+                        params.pop("parse_mode", None)
+                        tg_call("editMessageText", params)
+            self.last_edit_at = now
 
-        The complete process log is sent once the turn finishes, just like
-        the Claude bridge's final delivery.  Keeping this method as a no-op
-        lets notification handling consume live App Server events uniformly.
-        """
-        return None
+    def flush(self, force=False):
+        """Render the current thought/tool snapshot into one live message."""
+        now = time.monotonic()
+        if not force and self.progress_msg_id is not None:
+            if now - self.last_edit_at < EDIT_THROTTLE_S:
+                return
+        try:
+            self._send_or_edit_live(truncate_mdv2(self.live_text()), force=force)
+        except Exception as exc:
+            # Telegram hiccups must never stop App Server event consumption.
+            log(f"Live progress update failed: {exc}")
+
+    def replace_progress(self, text):
+        """Replace the live process card in place, returning success."""
+        with self.progress_lock:
+            if self.progress_msg_id is None:
+                return False
+            result = edit_rich(self.chat_id, self.progress_msg_id, text)
+            return bool(result and result.get("ok"))
 
     def deliver(self, stopped=False, error=None):
         final_index = next(
@@ -802,8 +865,12 @@ class TurnView:
                 visible.insert(0, f"…и ещё {hidden} шагов выше…")
             body = "\n".join(visible)
             rich = f"<details><summary>🔧 Процесс ({len(process_steps)})</summary>\n{body}\n</details>"
-            send_rich(self.chat_id, rich)
+            if not self.replace_progress(rich):
+                send_rich(self.chat_id, rich)
             send_rich(self.chat_id, answer)
+        elif self.progress_msg_id is not None:
+            if not self.replace_progress(answer):
+                send_rich(self.chat_id, answer)
         else:
             send_rich(self.chat_id, answer)
 

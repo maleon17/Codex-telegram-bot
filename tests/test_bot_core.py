@@ -89,7 +89,7 @@ class RenderingTests(unittest.TestCase):
         self.assertNotIn("Сначала проверю файл", text)
         self.assertNotIn("printf two", text)
 
-    def test_progress_is_not_sent_as_a_transient_draft(self):
+    def test_progress_uses_one_editable_telegram_message(self):
         calls = []
         original_tg_call = bot.tg_call
 
@@ -101,10 +101,16 @@ class RenderingTests(unittest.TestCase):
         try:
             view = bot.TurnView(1)
             view.flush(force=True)
+            view.add_thought_delta("Проверяю", item_id="reason-1")
+            view.flush(force=True)
         finally:
             bot.tg_call = original_tg_call
 
-        self.assertEqual(calls, [])
+        self.assertEqual([method for method, _ in calls], ["sendMessage", "editMessageText"])
+        self.assertEqual(calls[1][1]["message_id"], 42)
+        self.assertIn("🤔", calls[0][1]["text"])
+        self.assertIn("Проверяю", calls[1][1]["text"])
+        self.assertNotIn("sendMessageDraft", [method for method, _ in calls])
 
     def test_batch_inputs_preserve_order_and_separate_messages(self):
         inputs, paths = bot.combine_input_batch([
