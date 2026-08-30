@@ -640,10 +640,22 @@ def send_rich(chat_id, markdown_text):
 
 def edit_rich(chat_id, message_id, markdown_text):
     text = markdown_text[:RICH_MAX_CHARS]
-    result = tg_call("editMessageText", {
+    params = {
         "chat_id": chat_id, "message_id": message_id,
         "rich_message": {"markdown": text},
-    })
+    }
+    result = tg_call("editMessageText", params)
+    # A live progress edit can race Telegram's per-message rate limit. Wait
+    # for the server-provided window and retry the SAME edit before allowing
+    # the caller to use its last-resort send path; otherwise a transient 429
+    # leaves the old Thinking card and creates a duplicate final message.
+    if _rate_limited(result):
+        retry_after = (result.get("parameters") or {}).get("retry_after")
+        try:
+            time.sleep(min(60.0, max(1.0, float(retry_after))))
+        except (TypeError, ValueError):
+            time.sleep(1.0)
+        result = tg_call("editMessageText", params)
     if not result.get("ok") and not _rate_limited(result):
         description = str(result.get("description", "")).lower()
         if "not modified" not in description:
@@ -867,9 +879,17 @@ class TurnView:
             rich = f"<details><summary>🔧 Процесс ({len(process_steps)})</summary>\n{body}\n</details>"
             if not self.replace_progress(rich):
                 send_rich(self.chat_id, rich)
+            # A genuinely NEW message here is deliberate: an edit doesn't
+            # push a Telegram notification, a fresh send does. Reverted
+            # 2026-08-30 -- merging the process block and answer into one
+            # edited card (matching a since-reverted change on the Claude
+            # bridge side) silently killed the "your answer is ready"
+            # notification for every tool-using turn.
             send_rich(self.chat_id, answer)
         elif self.progress_msg_id is not None:
             if not self.replace_progress(answer):
+                # Last-resort delivery only when Telegram rejected the edit;
+                # a successful edit remains the sole final message.
                 send_rich(self.chat_id, answer)
         else:
             send_rich(self.chat_id, answer)
