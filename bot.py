@@ -14,11 +14,12 @@ from datetime import datetime
 from pathlib import Path
 
 from app_server import AppServerClient, AppServerError
-from telegram_format import escape_mdv2, strip_mdv2
+from telegram_format import escape_mdv2, rich_message_to_markdown, strip_mdv2
 
 
 EDIT_THROTTLE_S = 1.3
 BATCH_DEBOUNCE_S = 1.5
+BATCH_RETRY_S = 0.2
 MAX_MESSAGE_LEN = 4000
 RICH_MAX_CHARS = 30000
 HTTP_TIMEOUT_S = 20
@@ -104,6 +105,7 @@ class TenantRuntime:
         # Codex turn per update.
         self.pending_batch = []
         self.batch_timer = None
+        self.batch_generation = 0
 
 
 tenants = {}
@@ -236,25 +238,143 @@ def download_telegram_file(file_id, suggested_name="image.jpg"):
         raise
 
 
+FORWARD_FIELDS = (
+    "forward_origin", "forward_from", "forward_from_chat", "forward_sender_name",
+    "is_automatic_forward",
+)
+
+
+def is_forwarded_message(message):
+    """Return whether Telegram marked this update as a forwarded message."""
+    return any(message.get(field) for field in FORWARD_FIELDS)
+
+
+def _peer_label(peer, fallback="неизвестный источник"):
+    if not isinstance(peer, dict):
+        return fallback
+    name = " ".join(
+        str(peer.get(key)).strip()
+        for key in ("first_name", "last_name", "title")
+        if peer.get(key)
+    ).strip()
+    username = str(peer.get("username") or "").strip().lstrip("@")
+    if name and username:
+        return f"{name} (@{username})"
+    return name or (f"@{username}" if username else fallback)
+
+
+def forwarded_origin_label(message):
+    """Render Bot API forward metadata without dumping its raw JSON."""
+    origin = message.get("forward_origin")
+    if isinstance(origin, dict):
+        origin_type = origin.get("type")
+        if origin_type == "user":
+            return _peer_label(origin.get("sender_user"), "пользователь")
+        if origin_type == "hidden_user":
+            return str(origin.get("sender_user_name") or "скрытый отправитель")
+        if origin_type in ("chat", "channel"):
+            return _peer_label(origin.get("sender_chat") or origin.get("chat"), "чат/канал")
+        return (
+            _peer_label(origin.get("sender_user") or origin.get("sender_chat"), "")
+            or str(origin.get("author_signature") or "").strip()
+            or "источник"
+        )
+
+    if message.get("forward_sender_name"):
+        return str(message["forward_sender_name"])
+    if message.get("forward_from"):
+        return _peer_label(message["forward_from"], "пользователь")
+    if message.get("forward_from_chat"):
+        return _peer_label(message["forward_from_chat"], "чат/канал")
+    return "неизвестный источник"
+
+
+def forwarded_origin_note(message):
+    if not is_forwarded_message(message):
+        return ""
+    return f"[Пересланное сообщение от {forwarded_origin_label(message)}]"
+
+
+def message_attachment_note(message):
+    """Describe non-text Telegram content when App Server cannot attach it."""
+    notes = []
+    if message.get("photo"):
+        notes.append("фото")
+
+    document = message.get("document") or {}
+    if document:
+        filename = str(document.get("file_name") or "документ")
+        mime = str(document.get("mime_type") or "").strip()
+        notes.append(f"документ «{filename}»" + (f" ({mime})" if mime else ""))
+
+    for field, label in (
+        ("animation", "анимация/GIF"),
+        ("video", "видео"),
+        ("video_note", "видеосообщение"),
+        ("voice", "голосовое сообщение"),
+        ("audio", "аудио"),
+        ("sticker", "стикер"),
+        ("poll", "опрос"),
+        ("contact", "контакт"),
+        ("location", "геопозиция"),
+        ("venue", "место"),
+        ("dice", "кубик"),
+        ("game", "игра"),
+    ):
+        if message.get(field):
+            notes.append(label)
+    return ", ".join(notes)
+
+
 def message_inputs(message):
-    """Build App Server inputs from Telegram text/caption and image media."""
-    text = message.get("text") or message.get("caption") or ""
+    """Build App Server inputs from text, forwards and image media.
+
+    Bot API puts the original content of a forward in the same top-level
+    ``text``/``caption``/media fields as an ordinary message.  The forward
+    metadata is separate, so preserve a compact source note instead of
+    treating a forward as an empty update.  For media that App Server cannot
+    attach directly, pass a useful description so the bot still acknowledges
+    the message rather than silently dropping it.
+    """
+    raw_text = (
+        message.get("text")
+        or message.get("caption")
+        or rich_message_to_markdown(message.get("rich_message"))
+        or ""
+    )
+    text = raw_text.strip() if isinstance(raw_text, str) else ""
+    origin_note = forwarded_origin_note(message)
+    attachment_note = message_attachment_note(message)
+    photo = message.get("photo")
+    document = message.get("document") or {}
+    has_image = bool(photo) or str(document.get("mime_type", "")).startswith("image/")
+
+    text_parts = [part for part in (origin_note, text) if part]
+    if attachment_note and not has_image:
+        text_parts.append(f"[Вложение: {attachment_note}]")
+
     inputs = []
     paths = []
-    if isinstance(text, str) and text.strip():
-        inputs.append({"type": "text", "text": text.strip()})
-    photo = message.get("photo")
+    if text_parts:
+        inputs.append({"type": "text", "text": "\n\n".join(text_parts)})
     if isinstance(photo, list) and photo:
         path = download_telegram_file(photo[-1]["file_id"], "photo.jpg")
         paths.append(path)
         inputs.append({"type": "localImage", "path": path})
-    document = message.get("document") or {}
     if str(document.get("mime_type", "")).startswith("image/") and document.get("file_id"):
         path = download_telegram_file(document["file_id"], document.get("file_name") or "image")
         paths.append(path)
         inputs.append({"type": "localImage", "path": path})
+
+    if not inputs and attachment_note:
+        inputs.append({"type": "text", "text": "[Вложение: " + attachment_note + "]"})
+    if not inputs and message.get("rich_message"):
+        inputs.append({"type": "text", "text": "[Rich-сообщение без распознаваемого текста]"})
     if paths and not any(item.get("type") == "text" for item in inputs):
-        inputs.insert(0, {"type": "text", "text": "Посмотри на это изображение и ответь по контексту."})
+        prompt = "Посмотри на это изображение и ответь по контексту."
+        if origin_note:
+            prompt = f"{origin_note}\n\n{prompt}"
+        inputs.insert(0, {"type": "text", "text": prompt})
     return inputs, paths
 
 
@@ -1153,6 +1273,7 @@ def run_turn(runtime, inputs, thread_id, media_paths=None):
     done = threading.Event()
     error = None
     stopped = False
+    paths = []
     try:
         client = get_app_server(runtime)
         client.start_if_needed()
@@ -1568,6 +1689,7 @@ def cancel_pending_batch(runtime):
     with process_lock:
         timer = runtime.batch_timer
         runtime.batch_timer = None
+        runtime.batch_generation += 1
         entries = runtime.pending_batch
         runtime.pending_batch = []
     if timer is not None:
@@ -1577,12 +1699,37 @@ def cancel_pending_batch(runtime):
     )
 
 
-def flush_pending_batch(runtime, timer):
+def _schedule_batch_timer(runtime, delay=BATCH_DEBOUNCE_S):
+    with process_lock:
+        old_timer = runtime.batch_timer
+        runtime.batch_generation += 1
+        generation = runtime.batch_generation
+        timer = None
+
+        def fire():
+            flush_pending_batch(runtime, timer, generation)
+
+        timer = threading.Timer(delay, fire)
+        timer.daemon = True
+        runtime.batch_timer = timer
+    if old_timer is not None:
+        old_timer.cancel()
+    timer.start()
+
+
+def _requeue_batch(runtime, entries, delay=BATCH_RETRY_S):
+    """Put a batch back when a live turn is between startup/completion."""
+    with process_lock:
+        runtime.pending_batch = list(entries) + runtime.pending_batch
+    _schedule_batch_timer(runtime, delay)
+
+
+def flush_pending_batch(runtime, timer, generation):
     """Start the one turn represented by the current debounce window."""
     with process_lock:
         # A canceled timer can still wake up concurrently.  Only the newest
         # timer that is still registered for this chat may consume the batch.
-        if runtime.batch_timer is not timer:
+        if runtime.batch_timer is not timer or runtime.batch_generation != generation:
             return
         runtime.batch_timer = None
         entries = runtime.pending_batch
@@ -1595,11 +1742,24 @@ def flush_pending_batch(runtime, timer):
 
     inputs, media_paths = combine_input_batch(entries)
     if already_busy:
-        steered, error = steer_current_turn(runtime, inputs, media_paths)
-        if not steered:
-            cleanup_media_paths(media_paths)
-            send_plain(runtime.chat_id, f"Не получилось добавить сообщения в текущий ход: {error}")
-        return
+        steered, _ = steer_current_turn(runtime, inputs, media_paths)
+        if steered:
+            return
+        with process_lock:
+            still_busy = runtime.busy
+        if still_busy:
+            # The first updates can arrive while turn/start is still waiting
+            # for its ID.  Do not throw those messages away or emit one error
+            # per update; retry the single combined batch shortly.
+            _requeue_batch(runtime, entries)
+            return
+        # The old turn ended between the snapshot above and turn/steer.  Let
+        # this batch become the next ordinary turn instead of losing it.
+        with process_lock:
+            if runtime.busy:
+                _requeue_batch(runtime, entries)
+                return
+            runtime.busy = True
 
     with state_lock:
         thread_id = chat_state(runtime.chat_id).get("thread_id")
@@ -1611,31 +1771,10 @@ def flush_pending_batch(runtime, timer):
 
 
 def queue_message(runtime, inputs, media_paths=None):
-    """Debounce idle messages; inject directly when a turn is already live."""
+    """Debounce every message, including follow-ups during a live turn."""
     with process_lock:
-        if runtime.busy:
-            already_busy = True
-            timer = None
-        else:
-            already_busy = False
-            runtime.pending_batch.append((inputs, media_paths or []))
-            old_timer = runtime.batch_timer
-
-            def fire():
-                flush_pending_batch(runtime, timer)
-
-            timer = threading.Timer(BATCH_DEBOUNCE_S, fire)
-            timer.daemon = True
-            runtime.batch_timer = timer
-    if already_busy:
-        steered, error = steer_current_turn(runtime, inputs, media_paths)
-        if not steered:
-            cleanup_media_paths(media_paths)
-            send_plain(runtime.chat_id, f"Не получилось добавить сообщение в текущий ход: {error}")
-        return
-    if old_timer is not None:
-        old_timer.cancel()
-    timer.start()
+        runtime.pending_batch.append((inputs or [], list(media_paths or [])))
+    _schedule_batch_timer(runtime)
 
 
 def start_account_login(runtime):
@@ -1869,19 +2008,27 @@ def handle_message(message):
             send_plain(chat_id, "⛔ Доступ к Codex-боту не разрешён. Попроси владельца добавить твой Telegram ID в whitelist.txt.")
         return
     runtime = get_tenant(chat_id)
-    text = message.get("text") or message.get("caption") or ""
-    has_image = bool(message.get("photo")) or str(
-        (message.get("document") or {}).get("mime_type", "")
-    ).startswith("image/")
-    if (not isinstance(text, str) or not text.strip()) and not has_image:
+    raw_text = (
+        message.get("text")
+        or message.get("caption")
+        or rich_message_to_markdown(message.get("rich_message"))
+        or ""
+    )
+    text = raw_text.strip() if isinstance(raw_text, str) else ""
+    forwarded = is_forwarded_message(message)
+    rich_message = bool(message.get("rich_message"))
+    attachment_note = message_attachment_note(message)
+    if not text and not attachment_note and not forwarded and not rich_message:
         return
-    text = text.strip()
     with process_lock:
         draining = restart_draining
     if draining:
         send_plain(chat_id, "🔄 Уже начинаю перезапуск; сообщение пока не принято.")
         return
-    if text.startswith(("/", ".")):
+    # A forwarded message is data, not a command.  Otherwise forwarding a
+    # message beginning with /new or /stop would execute that command instead
+    # of sending the forwarded content to Codex.
+    if text.startswith(("/", ".")) and not forwarded and not rich_message:
         handle_command(chat_id, text)
         return
     account_status = chat_state(chat_id).get("account_status")
@@ -1894,7 +2041,9 @@ def handle_message(message):
     try:
         inputs, media_paths = message_inputs(message)
     except Exception as exc:
-        send_plain(chat_id, f"Не смог скачать изображение: {compact(str(exc), 500)}")
+        send_plain(chat_id, f"Не смог обработать вложение: {compact(str(exc), 500)}")
+        return
+    if not inputs:
         return
     queue_message(runtime, inputs, media_paths)
 

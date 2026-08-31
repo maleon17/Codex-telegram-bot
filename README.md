@@ -13,6 +13,7 @@ collapsible process log.
 
 - Persistent Codex threads: `/new`, `/sessions`, `/resume`.
 - Rapid consecutive messages (including forwarded batches) are combined into one prompt.
+- Forwarded text and Telegram rich messages keep their source/content context.
 - A message sent during an active turn is added to that same turn automatically.
 - Clean cancellation through `turn/interrupt` (`/stop`).
 - Context compaction through `thread/compact/start` (`/compact`).

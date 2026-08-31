@@ -129,6 +129,68 @@ class RenderingTests(unittest.TestCase):
             ],
         )
 
+    def test_forwarded_text_preserves_origin_as_prompt_context(self):
+        inputs, paths = bot.message_inputs({
+            "text": "Проверь это",
+            "forward_origin": {
+                "type": "user",
+                "sender_user": {"first_name": "Андрей", "username": "andrey"},
+            },
+        })
+        self.assertEqual(paths, [])
+        self.assertEqual(len(inputs), 1)
+        self.assertIn("Пересланное сообщение от Андрей (@andrey)", inputs[0]["text"])
+        self.assertIn("Проверь это", inputs[0]["text"])
+
+    def test_forwarded_rich_message_is_converted_to_prompt_text(self):
+        inputs, paths = bot.message_inputs({
+            "forward_origin": {"type": "hidden_user", "sender_user_name": "Автор"},
+            "rich_message": {"markdown": "**Ответ из другого чата**\n\nПроверь это."},
+        })
+        self.assertEqual(paths, [])
+        self.assertEqual(
+            inputs,
+            [{"type": "text", "text": "[Пересланное сообщение от Автор]\n\n**Ответ из другого чата**\n\nПроверь это."}],
+        )
+
+    def test_direct_rich_message_is_not_filtered_out(self):
+        queued = []
+        with patch.object(bot, "queue_message", side_effect=lambda runtime, inputs, paths: queued.append(inputs)):
+            bot.handle_message({
+                "chat": {"id": bot.OWNER_ID},
+                "from": {"id": bot.OWNER_ID},
+                "rich_message": {
+                    "blocks": [{"type": "paragraph", "text": [{"type": "bold", "text": "Ответ"}]}],
+                },
+            })
+        self.assertEqual(len(queued), 1)
+        self.assertIn("**Ответ**", queued[0][0]["text"])
+
+    def test_forwarded_non_image_media_is_not_silently_dropped(self):
+        inputs, paths = bot.message_inputs({
+            "voice": {"duration": 4, "mime_type": "audio/ogg"},
+            "forward_origin": {
+                "type": "hidden_user", "sender_user_name": "Скрытый автор",
+            },
+        })
+        self.assertEqual(paths, [])
+        self.assertEqual(len(inputs), 1)
+        self.assertIn("Скрытый автор", inputs[0]["text"])
+        self.assertIn("голосовое сообщение", inputs[0]["text"])
+
+    def test_forwarded_command_text_is_queued_as_data(self):
+        queued = []
+        with patch.object(bot, "handle_command", side_effect=AssertionError("forward became a command")), \
+                patch.object(bot, "queue_message", side_effect=lambda runtime, inputs, paths: queued.append(inputs)):
+            bot.handle_message({
+                "chat": {"id": bot.OWNER_ID},
+                "from": {"id": bot.OWNER_ID},
+                "text": "/stop",
+                "forward_origin": {"type": "hidden_user", "sender_user_name": "автор"},
+            })
+        self.assertEqual(len(queued), 1)
+        self.assertIn("/stop", queued[0][0]["text"])
+
     def test_steer_is_internal_only(self):
         self.assertNotIn("steer", [command for command, _ in bot.COMMANDS])
 
@@ -178,6 +240,71 @@ class RenderingTests(unittest.TestCase):
             ],
         )
         self.assertFalse(runtime.pending_batch)
+
+    def test_active_messages_are_combined_before_one_steer(self):
+        timers = []
+        steered = []
+
+        class FakeTimer:
+            def __init__(self, interval, function):
+                self.interval = interval
+                self.function = function
+                self.cancelled = False
+                timers.append(self)
+
+            def start(self):
+                pass
+
+            def cancel(self):
+                self.cancelled = True
+
+        runtime = bot.TenantRuntime(1)
+        runtime.busy = True
+        with patch.object(bot.threading, "Timer", FakeTimer), \
+                patch.object(bot, "steer_current_turn",
+                             side_effect=lambda runtime, inputs, paths: (
+                                 steered.append((inputs, paths)) or (True, None))):
+            bot.queue_message(runtime, [{"type": "text", "text": "раз"}], [])
+            bot.queue_message(runtime, [{"type": "text", "text": "два"}], [])
+            self.assertEqual(len(runtime.pending_batch), 2)
+            timers[-1].function()
+
+        self.assertEqual(len(steered), 1)
+        self.assertEqual(
+            steered[0][0],
+            [
+                {"type": "text", "text": "раз"},
+                {"type": "text", "text": "\n\n---\n\n"},
+                {"type": "text", "text": "два"},
+            ],
+        )
+        self.assertFalse(runtime.pending_batch)
+
+    def test_batch_waits_for_turn_id_instead_of_dropping_messages(self):
+        timers = []
+
+        class FakeTimer:
+            def __init__(self, interval, function):
+                self.function = function
+                self.cancelled = False
+                timers.append(self)
+
+            def start(self):
+                pass
+
+            def cancel(self):
+                self.cancelled = True
+
+        runtime = bot.TenantRuntime(1)
+        runtime.busy = True
+        with patch.object(bot.threading, "Timer", FakeTimer), \
+                patch.object(bot, "steer_current_turn", return_value=(False, "ещё запускается")):
+            bot.queue_message(runtime, [{"type": "text", "text": "не теряй"}], [])
+            timers[-1].function()
+
+        self.assertEqual(len(runtime.pending_batch), 1)
+        self.assertEqual(runtime.pending_batch[0][0][0]["text"], "не теряй")
+        self.assertIs(runtime.batch_timer, timers[-1])
 
     def test_empty_reasoning_is_not_rendered_as_a_blank_step(self):
         self.assertEqual(bot.render_process_item({"type": "reasoning", "summary": []}), "")
