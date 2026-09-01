@@ -4,6 +4,7 @@
 import json
 import os
 import signal
+import subprocess
 import sys
 import tempfile
 import threading
@@ -40,6 +41,7 @@ COMMANDS = [
     ("account", "Состояние аккаунта Codex"),
     ("login", "Подключить свой аккаунт Codex"),
     ("restart", "Перезапустить Codex-бота"),
+    ("update", "Обновить бота из git и перезапустить"),
 ]
 
 
@@ -1838,7 +1840,7 @@ def handle_command(chat_id, command):
     cmd = raw_cmd.split("@", 1)[0].lower().lstrip("/.")
     arg = arg.strip()
     if cmd in {"new", "resume", "compact", "model", "effort", "mode",
-               "workspace", "restart", "stop"}:
+               "workspace", "restart", "update", "stop"}:
         cancel_pending_batch(runtime)
     if cmd in ("start", "help"):
         send_plain(chat_id, "Codex Telegram bridge. Команды доступны в меню бота.")
@@ -1986,6 +1988,34 @@ def handle_command(chat_id, command):
             send_plain(chat_id, "🔁 Перезапуск запланирован после завершения текущего хода.")
         else:
             send_plain(chat_id, "🔁 Перезапуск запланирован между ходами.")
+        return True
+    if cmd == "update":
+        if chat_id != OWNER_ID:
+            send_plain(chat_id, "Обновление доступно только владельцу бота.")
+            return True
+        send_plain(chat_id, "⬇️ Обновляю из git...")
+        script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "update.sh")
+        try:
+            result = subprocess.run(
+                [script_path], capture_output=True, text=True, timeout=120, check=False
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            send_plain(chat_id, f"❌ Обновление не удалось:\n```\n{compact(str(exc), 2000)}\n```")
+            return True
+        if result.returncode != 0:
+            failure = (result.stderr.strip() or result.stdout.strip() or
+                       f"update.sh завершился с кодом {result.returncode}")
+            send_plain(chat_id, f"❌ Обновление не удалось:\n```\n{failure[-2000:]}\n```")
+            return True
+        summary = next(
+            (line.strip() for line in reversed(result.stdout.splitlines()) if line.strip()),
+            "Обновление завершено.",
+        )
+        request_restart(chat_id)
+        if runtime.busy or runtime.pending_batch:
+            send_plain(chat_id, f"✅ {summary}\n🔁 Перезапуск запланирован после завершения текущего хода.")
+        else:
+            send_plain(chat_id, f"✅ {summary}\n🔁 Перезапуск запланирован между ходами.")
         return True
     if cmd == "stop":
         running = stop_current_process(runtime)

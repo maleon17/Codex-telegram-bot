@@ -102,6 +102,7 @@ journalctl -u codex-telegram-bot -f
 | `/account` | Show the current isolated Codex account |
 | `/login` | Start device-code login for an additional user |
 | `/restart` | Owner-only safe deferred restart |
+| `/update` | Owner-only: git pull the latest push, then restart the same way `/restart` does |
 
 ## Multi-account setup
 
@@ -165,7 +166,15 @@ journalctl -u codex-telegram-bot -f
 # Restart only after all active turns finish
 ./request-restart
 
-# Update
+# Update and schedule a safe deferred restart in one step
+./update.sh
+```
+
+The owner can run `/update` in Telegram instead; it performs the same update and
+schedules the restart through the existing safe watcher. As a shell-access
+fallback, or when you do not want to wait for the bot to process a command, run:
+
+```bash
 git pull --ff-only
 ./request-restart
 ```
