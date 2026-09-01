@@ -19,6 +19,14 @@ Usage:
     bridge_exec.py [--workspace PATH] [--resume ID] [--chat-id ID]
                     [--timeout SECONDS] PROMPT...
 
+Every call through this script is a delegated turn by definition, so the
+final answer's footer always notes it -- the OWNER's own thread from
+before this call touched anything (so they can return to whatever they
+were doing) plus a `/resume` hint for the thread this delegated task
+itself just used, in case they want to continue THAT specific one
+instead. Nothing needs to be passed in for this; bot.py's watcher
+captures the prior thread itself.
+
 Prints the final answer to stdout and exits 0, or prints an error to
 stderr and exits 1 on timeout/failure.
 """
@@ -113,16 +121,11 @@ def main():
         request["workspace"] = args.workspace
     if args.resume:
         request["resume_thread_id"] = args.resume
-    # CLAUDE_CODE_SESSION_ID is set on Claude's own Bash tool automatically
-    # (it's the caller here) -- this is what turns on the "Session id: X /
-    # resume Y" footer for THIS turn only (see bot.py's run_turn finalize):
-    # X is this session (the delegator), Y is the resulting Codex thread.
-    # A non-Claude caller (a human running this by hand, or Codex itself
-    # via some other mechanism) simply won't set it, and the footer won't
-    # appear -- it is a delegation marker, not a per-message one.
-    delegator_session_id = os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("DELEGATOR_SESSION_ID")
-    if delegator_session_id:
-        request["delegator_session_id"] = delegator_session_id
+    # Every request through this file channel is a delegated one by
+    # definition (a human never writes this file) -- bot.py's watcher
+    # captures the owner's own PRIOR thread itself and shows it back in
+    # the footer ("your session, before delegation") so they can return to
+    # it; nothing needs to be passed here for that.
 
     tmp = request_path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:

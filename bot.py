@@ -997,16 +997,24 @@ class TurnView:
             answer += f"\n\n{self.context_notice}"
         with state_lock:
             thread_id = chat_state(self.chat_id).get("thread_id")
-            delegator_session_id = chat_state(self.chat_id).get("pending_delegator_session_id")
+            prior_thread_id = chat_state(self.chat_id).get("pending_delegator_session_id")
         # Delegation-only footer, not a per-message one (per the owner
         # directly): only present when this turn was actually kicked off
         # via external_request_watcher(), and one-shot -- cleared right
         # after use so it doesn't leak onto the next, ordinary turn.
-        if delegator_session_id and thread_id:
-            answer += (
-                f"\n\nТвой session id: `{delegator_session_id[:8]}`. "
-                f"Продолжить: `/resume {thread_id[:8]}`"
-            )
+        # prior_thread_id is the OWNER's own thread from before this
+        # delegated call touched anything (empty string "" if there wasn't
+        # one) -- so they can return to their own conversation, separate
+        # from `thread_id` below, which is whatever this delegated task
+        # itself ended up using.
+        if prior_thread_id is not None and thread_id:
+            if prior_thread_id:
+                answer += (
+                    f"\n\nТвой session id (до делегации): `{prior_thread_id[:8]}`. "
+                    f"Продолжить делегированную: `/resume {thread_id[:8]}`"
+                )
+            else:
+                answer += f"\n\nПродолжить делегированную сессию: `/resume {thread_id[:8]}`"
             update_state(self.chat_id, pending_delegator_session_id=None)
         write_last_turn(self.chat_id, answer)
 
@@ -1686,17 +1694,25 @@ def external_request_watcher():
         if not text:
             continue
         runtime = get_tenant(chat_id)
+        # Capture whatever thread was already active for this chat BEFORE
+        # this delegated call touches anything -- shown back in the footer
+        # as "your session" so the owner can return to whatever they were
+        # doing before Claude/Codex jumped in, separate from whatever
+        # thread the delegated task itself ends up using. Every request
+        # arriving through this file channel IS by definition a delegated
+        # one (a human never writes this file, only bridge_exec.py does),
+        # so no opt-in flag is needed from the caller.
+        with state_lock:
+            prior_thread_id = chat_state(chat_id).get("thread_id")
         if request.get("workspace"):
             update_state(chat_id, workspace=request["workspace"])
         if request.get("resume_thread_id"):
             update_state(chat_id, thread_id=request["resume_thread_id"])
-        # Marks the NEXT completed turn as delegated so its footer carries
-        # the delegator's own session id (see the footer code in run_turn's
-        # finalize step) -- ordinary human-typed turns never set this, so
-        # they never get that footer at all, per the owner directly: the
-        # id/resume footer is a delegation mechanism, not a per-message one.
-        if request.get("delegator_session_id"):
-            update_state(chat_id, pending_delegator_session_id=request["delegator_session_id"])
+        # "" (not None) marks this turn as delegated with no prior thread to
+        # offer back; None means "not delegated" (an ordinary Telegram turn
+        # never touches this field at all). See the footer code in
+        # run_turn's finalize step.
+        update_state(chat_id, pending_delegator_session_id=prior_thread_id or "")
         queue_message(runtime, [{"type": "text", "text": text}])
 
 
