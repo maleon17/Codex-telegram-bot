@@ -8,12 +8,11 @@ simply does not deliver them back to the sender, confirmed live
 can inject into a private 1:1 chat either -- it only ever has its two real
 participants). Since bot.py is our own code, the real fix is to skip
 Telegram for this leg entirely: this script writes a request file that
-bot.py's external_request_watcher() polls and feeds straight into
-queue_message() -- the exact same entry point a real incoming Telegram
-message reaches after handle_message() parses it. Real formatting, real
-/resume, real mid-turn steering (the owner typing into the same chat while
-this runs still gets genuinely steered in) all come from the actual
-product for free -- only the INPUT side bypasses Telegram now.
+bot.py's external_request_watcher() polls and dispatches it into the
+dedicated persistent delegate tenant. Real formatting, real /resume, and
+real mid-turn steering (the owner typing into the same chat while this runs
+still gets genuinely steered into the delegate process) all come from the
+actual product for free -- only the INPUT side bypasses Telegram now.
 
 Usage:
     bridge_exec.py [--workspace PATH] [--resume ID] [--chat-id ID]
@@ -31,6 +30,7 @@ Prints the final answer to stdout and exits 0, or prints an error to
 stderr and exits 1 on timeout/failure.
 """
 import argparse
+import fcntl
 import json
 import os
 import sys
@@ -61,12 +61,18 @@ def external_request_path():
     )
 
 
-def last_turn_path(chat_id):
-    # Mirrors bot.py's write_last_turn(): STATE_FILE.with_name(f"last_turn_{chat_id}.json").
+def last_turn_path(chat_id, delegated=False):
+    # Mirrors bot.py's write_last_turn(). Keep the ordinary signal path
+    # stable, but never let a delegate poll the owner's signal file.
     state_file = os.environ.get(
         "CODEX_BOT_STATE_FILE", os.path.join(ROOT, "state.json"),
     )
-    return os.path.join(os.path.dirname(state_file), f"last_turn_{chat_id}.json")
+    state_instance_name = os.path.splitext(os.path.basename(state_file))[0]
+    filename = (
+        f"last_turn_{state_instance_name}_delegate_{chat_id}.json"
+        if delegated else f"last_turn_{chat_id}.json"
+    )
+    return os.path.join(os.path.dirname(os.path.abspath(state_file)), filename)
 
 
 def poll_until_done(chat_id, baseline_ts, timeout_s, poll_interval=2):
@@ -75,7 +81,7 @@ def poll_until_done(chat_id, baseline_ts, timeout_s, poll_interval=2):
     token's getUpdates stream exclusively (only one consumer ever sees a
     given update), so a second independent poller there would just starve
     forever. See bot.py's write_last_turn()."""
-    path = last_turn_path(chat_id)
+    path = last_turn_path(chat_id, delegated=True)
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         try:
@@ -87,6 +93,10 @@ def poll_until_done(chat_id, baseline_ts, timeout_s, poll_interval=2):
             return data["text"]
         time.sleep(poll_interval)
     raise TimeoutError(f'No completed turn signalled via {path} within {timeout_s}s.')
+
+
+def delegate_lock_path(request_path):
+    return request_path + ".delegate.lock"
 
 
 def main():
@@ -102,41 +112,45 @@ def main():
     chat_id = args.chat_id or int(env.get("OWNER_ID") or os.environ.get("OWNER_ID") or DEFAULT_OWNER_ID)
 
     request_path = external_request_path()
-    if os.path.exists(request_path):
-        print(f"{request_path} already has an unconsumed request -- "
-              f"bot.py hasn't picked it up yet, or it's stuck. Not overwriting.",
-              file=sys.stderr)
-        sys.exit(1)
+    # One real chat has one stable delegate tenant. Serialize bridge_exec
+    # callers so a second process cannot overwrite the request or consume
+    # the first process's delegate signal while that tenant is busy.
+    with open(delegate_lock_path(request_path), "a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if os.path.exists(request_path):
+            print(f"{request_path} already has an unconsumed request -- "
+                  f"bot.py hasn't picked it up yet, or it's stuck. Not overwriting.",
+                  file=sys.stderr)
+            sys.exit(1)
 
-    # Baseline BEFORE writing the request -- only a last_turn file written
-    # strictly after this counts as ours, not a stale prior turn's.
-    try:
-        with open(last_turn_path(chat_id), encoding="utf-8") as f:
-            baseline_ts = json.load(f).get("ts", 0)
-    except (FileNotFoundError, json.JSONDecodeError):
-        baseline_ts = 0
+        # Baseline BEFORE writing the request -- only a delegate signal file
+        # written strictly after this counts as ours, not a stale owner turn
+        # or a previous delegate completion.
+        try:
+            with open(last_turn_path(chat_id, delegated=True), encoding="utf-8") as f:
+                baseline_ts = json.load(f).get("ts", 0)
+        except (FileNotFoundError, json.JSONDecodeError):
+            baseline_ts = 0
 
-    request = {"chat_id": chat_id, "text": " ".join(args.prompt)}
-    if args.workspace:
-        request["workspace"] = args.workspace
-    if args.resume:
-        request["resume_thread_id"] = args.resume
-    # Every request through this file channel is a delegated one by
-    # definition (a human never writes this file) -- bot.py's watcher
-    # captures the owner's own PRIOR thread itself and shows it back in
-    # the footer ("your session, before delegation") so they can return to
-    # it; nothing needs to be passed here for that.
+        request = {"chat_id": chat_id, "text": " ".join(args.prompt)}
+        if args.workspace:
+            request["workspace"] = args.workspace
+        if args.resume:
+            request["resume_thread_id"] = args.resume
+        # Every request through this file channel is a delegated one by
+        # definition (a human never writes this file). The server owns the
+        # delegate-only state and footer, so the request JSON stays unchanged.
 
-    tmp = request_path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(request, f)
-    os.replace(tmp, request_path)
+        tmp = request_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(request, f)
+        os.replace(tmp, request_path)
 
-    try:
-        final_text = poll_until_done(chat_id, baseline_ts, args.timeout)
-    except TimeoutError as exc:
-        print(str(exc), file=sys.stderr)
-        sys.exit(1)
+        try:
+            final_text = poll_until_done(chat_id, baseline_ts, args.timeout)
+        except TimeoutError as exc:
+            print(str(exc), file=sys.stderr)
+            sys.exit(1)
 
     print(final_text)
 

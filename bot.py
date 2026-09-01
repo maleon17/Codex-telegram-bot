@@ -67,6 +67,7 @@ CODEX_SANDBOX = os.environ.get("CODEX_SANDBOX", "danger-full-access")
 STATE_FILE = Path(
     os.environ.get("CODEX_BOT_STATE_FILE", Path(__file__).with_name("state.json"))
 ).expanduser()
+STATE_INSTANCE_NAME = STATE_FILE.stem
 RESTART_SIGNAL_FILE = Path(os.environ.get(
     "CODEX_BOT_RESTART_FILE", Path(__file__).with_name("restart.request")
 )).expanduser()
@@ -88,9 +89,26 @@ rate_limit_until = 0.0
 restart_draining = False
 
 
+DELEGATE_KEY_PREFIX = "delegate:"
+
+
+def delegate_key(chat_id):
+    """Return the stable state/process key for a delegated tenant."""
+    return f"{DELEGATE_KEY_PREFIX}{int(chat_id)}"
+
+
+def real_chat_id(state_key):
+    """Return the Telegram chat id represented by a state key."""
+    value = str(state_key)
+    if value.startswith(DELEGATE_KEY_PREFIX):
+        value = value[len(DELEGATE_KEY_PREFIX):]
+    return int(value)
+
+
 class TenantRuntime:
-    def __init__(self, chat_id):
+    def __init__(self, chat_id, state_key=None):
         self.chat_id = int(chat_id)
+        self.state_key = str(state_key if state_key is not None else self.chat_id)
         self.busy = False
         self.app_server = None
         self.loaded_thread_id = None
@@ -114,6 +132,7 @@ class TenantRuntime:
 
 
 tenants = {}
+tenants_delegate = {}
 
 
 def get_tenant(chat_id):
@@ -124,6 +143,27 @@ def get_tenant(chat_id):
             runtime = TenantRuntime(chat_id)
             tenants[chat_id] = runtime
         return runtime
+
+
+def get_delegate_tenant(chat_id):
+    """Return the persistent delegated runtime for a real Telegram chat."""
+    chat_id = int(chat_id)
+    with process_lock:
+        runtime = tenants_delegate.get(chat_id)
+        if runtime is None:
+            runtime = TenantRuntime(chat_id, state_key=delegate_key(chat_id))
+            tenants_delegate[chat_id] = runtime
+        return runtime
+
+
+def active_delegate_tenant(chat_id):
+    """Return a delegate that must receive the owner's next input."""
+    chat_id = int(chat_id)
+    with process_lock:
+        runtime = tenants_delegate.get(chat_id)
+        if runtime is not None and (runtime.busy or runtime.pending_batch):
+            return runtime
+    return None
 
 
 def load_whitelist():
@@ -416,7 +456,7 @@ def chat_state(chat_id):
         entry.setdefault("last_usage", None)
         entry.setdefault("session_usage", None)
         entry.setdefault("context_window", None)
-        entry.setdefault("account_status", "ready" if int(chat_id) == OWNER_ID else None)
+        entry.setdefault("account_status", "ready" if real_chat_id(chat_id) == OWNER_ID else None)
         entry.setdefault("pending_delegator_session_id", None)
         return entry
 
@@ -433,13 +473,18 @@ def update_runtime_state(**values):
         _save_state_locked()
 
 
-def write_last_turn(chat_id, text):
+def write_last_turn(chat_id, text, delegated=False):
     """Signal a completed turn's final text via a plain file instead of
     Telegram's getUpdates -- this process already owns that bot token's
     getUpdates stream exclusively (only one consumer can ever see a given
     update), so an external script polling the same API would just starve.
-    bridge_exec.py polls this file instead."""
-    path = STATE_FILE.with_name(f"last_turn_{chat_id}.json")
+    Ordinary and delegated turns deliberately use different signal files;
+    bridge_exec.py polls the delegated one."""
+    filename = (
+        f"last_turn_{STATE_INSTANCE_NAME}_delegate_{chat_id}.json"
+        if delegated else f"last_turn_{chat_id}.json"
+    )
+    path = STATE_FILE.with_name(filename)
     tmp = path.with_suffix(".tmp")
     try:
         with open(tmp, "w", encoding="utf-8") as f:
@@ -806,8 +851,10 @@ def edit_rich(chat_id, message_id, markdown_text):
 
 
 class TurnView:
-    def __init__(self, chat_id):
-        self.chat_id = chat_id
+    def __init__(self, chat_id, state_key=None):
+        self.chat_id = int(chat_id)
+        self.state_key = str(state_key if state_key is not None else self.chat_id)
+        self.delegated = self.state_key != str(self.chat_id)
         self.items = []
         self.process_items = []
         self.current_thought = None
@@ -861,7 +908,7 @@ class TurnView:
         if event_type == "thread.started":
             thread_id = event.get("thread_id")
             if thread_id:
-                save_thread_id(self.chat_id, thread_id)
+                save_thread_id(self.state_key, thread_id)
         elif event_type == "turn.started":
             pass
         elif event_type in ("item.started", "item.updated"):
@@ -886,7 +933,7 @@ class TurnView:
             self.completed = True
             self.usage = event.get("usage")
             if isinstance(self.usage, dict):
-                update_state(self.chat_id, last_usage=self.usage)
+                update_state(self.state_key, last_usage=self.usage)
 
     def live_text(self):
         lines = []
@@ -996,8 +1043,8 @@ class TurnView:
         if self.context_notice:
             answer += f"\n\n{self.context_notice}"
         with state_lock:
-            thread_id = chat_state(self.chat_id).get("thread_id")
-            prior_thread_id = chat_state(self.chat_id).get("pending_delegator_session_id")
+            thread_id = chat_state(self.state_key).get("thread_id")
+            prior_thread_id = chat_state(self.state_key).get("pending_delegator_session_id")
         # Delegation-only footer, not a per-message one (per the owner
         # directly): only present when this turn was actually kicked off
         # via external_request_watcher(), and one-shot -- cleared right
@@ -1015,21 +1062,22 @@ class TurnView:
                 )
             else:
                 answer += f"\n\nПродолжить делегированную сессию: `/resume {thread_id[:8]}`"
-            # The delegated thread is live only for this one turn -- restore
-            # the owner's own pre-delegation thread right away so their next
-            # ordinary Telegram message continues their own conversation,
-            # not the delegated one. `/resume <id>` above (looked up from
-            # session files on disk, not from this state) still works if
-            # they want to actually continue the delegated thread instead.
-            update_state(
-                self.chat_id,
-                pending_delegator_session_id=None,
-                thread_id=prior_thread_id or None,
-                last_usage=None,
-                session_usage=None,
-                context_window=None,
-            )
-        write_last_turn(self.chat_id, answer)
+            # The old owner-key delegation path is live only for this one
+            # turn -- preserve c130528's rollback so the next ordinary
+            # Telegram message continues the owner's own conversation.
+            # A delegate has its own state key, so it keeps its own thread.
+            if self.delegated:
+                update_state(self.state_key, pending_delegator_session_id=None)
+            else:
+                update_state(
+                    self.state_key,
+                    pending_delegator_session_id=None,
+                    thread_id=prior_thread_id or None,
+                    last_usage=None,
+                    session_usage=None,
+                    context_window=None,
+                )
+        write_last_turn(self.chat_id, answer, delegated=self.delegated)
 
         if process_items:
             process_steps = [
@@ -1114,7 +1162,7 @@ def handle_app_notification(runtime, method, params):
         return
     if method == "account/login/completed":
         success = bool(params.get("success"))
-        update_state(runtime.chat_id, account_status="ready" if success else "login_failed")
+        update_state(runtime.state_key, account_status="ready" if success else "login_failed")
         if success:
             send_plain(runtime.chat_id, "✅ Вход в аккаунт Codex завершён.")
         else:
@@ -1170,7 +1218,7 @@ def handle_app_notification(runtime, method, params):
                     f"⚠️ Контекст заполнен на {ratio:.0%}; скоро понадобится /compact."
                 )
         update_state(
-            runtime.chat_id,
+            runtime.state_key,
             last_usage=view.usage,
             session_usage=_usage_breakdown(token_usage.get("total") or {}),
             context_window=token_usage.get("modelContextWindow"),
@@ -1206,7 +1254,7 @@ def handle_app_notification(runtime, method, params):
 
 def _thread_params(runtime, thread_id=None):
     with state_lock:
-        snapshot = dict(chat_state(runtime.chat_id))
+        snapshot = dict(chat_state(runtime.state_key))
     params = {
         "cwd": snapshot.get("workspace") or CODEX_CWD,
         "sandbox": snapshot.get("sandbox") or CODEX_SANDBOX,
@@ -1235,7 +1283,7 @@ def model_key(model):
 def selected_model(runtime, models=None, persist=True):
     models = models if models is not None else available_models(runtime)
     with state_lock:
-        snapshot = dict(chat_state(runtime.chat_id))
+        snapshot = dict(chat_state(runtime.state_key))
     current = snapshot.get("model")
     chosen = next((model for model in models if model_key(model) == current), None)
     if chosen is None:
@@ -1252,7 +1300,7 @@ def selected_model(runtime, models=None, persist=True):
         if snapshot.get("effort") not in supported:
             updates["effort"] = chosen.get("defaultReasoningEffort") or (supported[0] if supported else None)
         if updates:
-            update_state(runtime.chat_id, **updates)
+            update_state(runtime.state_key, **updates)
     return chosen
 
 
@@ -1275,7 +1323,7 @@ def render_effort_picker(runtime):
     chosen = selected_model(runtime, models)
     if not chosen:
         return "Codex не вернул доступных моделей."
-    current = chat_state(runtime.chat_id).get("effort")
+    current = chat_state(runtime.state_key).get("effort")
     lines = [f"⚡ Мощность модели {chosen.get('displayName') or model_key(chosen)}:"]
     for option in chosen.get("supportedReasoningEfforts", []):
         if not isinstance(option, dict):
@@ -1311,7 +1359,7 @@ def ensure_thread(runtime, client, requested_thread_id):
     with process_lock:
         runtime.loaded_thread_id = thread_id
         runtime.loaded_server_pid = process_pid
-    save_thread_id(runtime.chat_id, thread_id)
+    save_thread_id(runtime.state_key, thread_id)
     return thread_id
 
 
@@ -1326,7 +1374,7 @@ def sandbox_policy(name, workspace):
 
 def run_turn(runtime, inputs, thread_id, media_paths=None):
     chat_id = runtime.chat_id
-    view = TurnView(chat_id)
+    view = TurnView(chat_id, state_key=runtime.state_key)
     done = threading.Event()
     error = None
     stopped = False
@@ -1336,13 +1384,14 @@ def run_turn(runtime, inputs, thread_id, media_paths=None):
         client.start_if_needed()
         with state_lock:
             needs_model_settings = not (
-                chat_state(chat_id).get("model") and chat_state(chat_id).get("effort")
+                chat_state(runtime.state_key).get("model")
+                and chat_state(runtime.state_key).get("effort")
             )
         if needs_model_settings:
             selected_model(runtime)
         server_thread_id = ensure_thread(runtime, client, thread_id)
         with state_lock:
-            snapshot = dict(chat_state(chat_id))
+            snapshot = dict(chat_state(runtime.state_key))
         with process_lock:
             runtime.active_view = view
             runtime.active_done = done
@@ -1412,7 +1461,7 @@ def run_turn(runtime, inputs, thread_id, media_paths=None):
 
 def run_compaction(runtime, thread_id):
     chat_id = runtime.chat_id
-    view = TurnView(chat_id)
+    view = TurnView(chat_id, state_key=runtime.state_key)
     done = threading.Event()
     error = None
     try:
@@ -1436,7 +1485,12 @@ def run_compaction(runtime, thread_id):
             message = f"🗜 Не удалось сжать контекст: {error}"
             send_plain(chat_id, message)
         else:
-            update_state(chat_id, last_usage=None, session_usage=None, context_window=None)
+            update_state(
+                runtime.state_key,
+                last_usage=None,
+                session_usage=None,
+                context_window=None,
+            )
             message = "🗜 Контекст сессии сжат. Можно продолжать."
             send_plain(chat_id, message)
     except Exception as exc:
@@ -1546,12 +1600,12 @@ def rate_limit_line(label, window):
 def build_usage_report(runtime):
     chat_id = runtime.chat_id
     try:
-        if not chat_state(chat_id).get("model"):
+        if not chat_state(runtime.state_key).get("model"):
             selected_model(runtime)
     except Exception as exc:
         log(f"Could not resolve model for usage: {exc}")
     with state_lock:
-        snapshot = dict(chat_state(chat_id))
+        snapshot = dict(chat_state(runtime.state_key))
     thread_id = snapshot.get("thread_id")
     last = snapshot.get("last_usage") or {}
     total = snapshot.get("session_usage") or last
@@ -1652,7 +1706,8 @@ def restart_watcher():
         if not RESTART_SIGNAL_FILE.exists():
             continue
         with process_lock:
-            if any(runtime.busy or runtime.pending_batch for runtime in tenants.values()):
+            runtimes = list(tenants.values()) + list(tenants_delegate.values())
+            if any(runtime.busy or runtime.pending_batch for runtime in runtimes):
                 continue
             restart_draining = True
         try:
@@ -1682,11 +1737,10 @@ def external_request_watcher():
     not something fixable at the code level. Since this whole product is
     code we control, the actual fix is to skip Telegram for this leg
     entirely: bridge_exec.py writes a request file here instead of
-    pretending to be an incoming message, and this feeds it straight into
-    queue_message() -- the exact same entry point a real Telegram message
-    reaches after handle_message() parses it -- so busy handling, real
-    turn/steer, and everything else downstream behaves identically
-    regardless of which channel the text came in on."""
+    pretending to be an incoming message. Every request gets the separate
+    persistent delegate tenant for its real Telegram chat; it never reuses
+    or steers the owner's tenant unless the owner explicitly sends a real
+    Telegram message while the delegate is busy."""
     while True:
         time.sleep(1)
         if not EXTERNAL_REQUEST_FILE.exists():
@@ -1702,31 +1756,20 @@ def external_request_watcher():
             pass
         if not isinstance(request, dict):
             continue
-        chat_id = request.get("chat_id") or OWNER_ID
+        try:
+            chat_id = int(request.get("chat_id") or OWNER_ID)
+        except (TypeError, ValueError):
+            log(f"Ignoring external request with invalid chat_id: {request.get('chat_id')!r}")
+            continue
         text = request.get("text")
         if not text:
             continue
-        runtime = get_tenant(chat_id)
-        # Capture whatever thread was already active for this chat BEFORE
-        # this delegated call touches anything -- shown back in the footer
-        # as "your session" so the owner can return to whatever they were
-        # doing before Claude/Codex jumped in, separate from whatever
-        # thread the delegated task itself ends up using. Every request
-        # arriving through this file channel IS by definition a delegated
-        # one (a human never writes this file, only bridge_exec.py does),
-        # so no opt-in flag is needed from the caller.
-        with state_lock:
-            prior_thread_id = chat_state(chat_id).get("thread_id")
-        if request.get("workspace"):
-            update_state(chat_id, workspace=request["workspace"])
-        if request.get("resume_thread_id"):
-            update_state(chat_id, thread_id=request["resume_thread_id"])
-        # "" (not None) marks this turn as delegated with no prior thread to
-        # offer back; None means "not delegated" (an ordinary Telegram turn
-        # never touches this field at all). See the footer code in
-        # run_turn's finalize step.
-        update_state(chat_id, pending_delegator_session_id=prior_thread_id or "")
-        queue_message(runtime, [{"type": "text", "text": text}])
+        start_delegate_turn(
+            chat_id,
+            text,
+            resume_thread_id=request.get("resume_thread_id"),
+            workspace=request.get("workspace"),
+        )
 
 
 def stop_current_process(runtime):
@@ -1873,7 +1916,7 @@ def flush_pending_batch(runtime, timer, generation):
             runtime.busy = True
 
     with state_lock:
-        thread_id = chat_state(runtime.chat_id).get("thread_id")
+        thread_id = chat_state(runtime.state_key).get("thread_id")
     threading.Thread(
         target=run_turn,
         args=(runtime, inputs, thread_id, media_paths),
@@ -1888,6 +1931,102 @@ def queue_message(runtime, inputs, media_paths=None):
     _schedule_batch_timer(runtime)
 
 
+def _delegate_error(chat_id, message):
+    send_plain(chat_id, message)
+    write_last_turn(chat_id, message, delegated=True)
+
+
+def start_delegate_turn(chat_id, text, resume_thread_id=None, workspace=None):
+    """Start a delegated turn in the real chat's isolated delegate tenant."""
+    chat_id = int(chat_id)
+    runtime = get_delegate_tenant(chat_id)
+    requested_thread_id = str(resume_thread_id or "").strip() or None
+    delegate_state_key = runtime.state_key
+
+    with state_lock:
+        owner_state = dict(chat_state(chat_id))
+        delegate_state = dict(chat_state(delegate_state_key))
+    owner_thread_id = owner_state.get("thread_id")
+    delegate_thread_id = delegate_state.get("thread_id")
+
+    if requested_thread_id:
+        valid_delegate_thread = bool(
+            delegate_thread_id
+            and (
+                delegate_thread_id == requested_thread_id
+                or delegate_thread_id.startswith(requested_thread_id)
+            )
+        )
+        owner_thread_conflict = bool(
+            owner_thread_id
+            and (
+                delegate_thread_id == owner_thread_id
+                or owner_thread_id.startswith(requested_thread_id)
+            )
+        )
+        if not valid_delegate_thread or owner_thread_conflict:
+            _delegate_error(
+                chat_id,
+                "Нельзя продолжить эту делегацию: resume_thread_id не совпадает "
+                "с последним делегированным тредом.",
+            )
+            return False
+
+    with process_lock:
+        delegate_busy = runtime.busy or bool(runtime.pending_batch)
+        if not delegate_busy:
+            cancel_pending_batch(runtime)
+            runtime.busy = True
+            if not requested_thread_id:
+                if runtime.app_server is not None:
+                    # A fresh delegation must not inherit background work from
+                    # a previous delegate turn. Do not reuse this client after
+                    # close(): its old reader thread may still be unwinding.
+                    old_client = runtime.app_server
+                    runtime.app_server = None
+                    old_client.close()
+                runtime.loaded_thread_id = None
+                runtime.loaded_server_pid = None
+    if delegate_busy:
+        _delegate_error(chat_id, "Уже выполняю предыдущую делегированную задачу.")
+        return False
+
+    updates = {"pending_delegator_session_id": owner_thread_id or ""}
+    if requested_thread_id:
+        # Keep the full persisted ID; the caller may pass the short prefix
+        # shown in the footer, but App Server's resume endpoint needs the ID.
+        updates["thread_id"] = delegate_thread_id
+        if workspace:
+            updates["workspace"] = workspace
+        thread_id = delegate_thread_id
+    else:
+        updates.update(
+            thread_id=None,
+            last_usage=None,
+            session_usage=None,
+            context_window=None,
+            model=owner_state.get("model"),
+            effort=owner_state.get("effort"),
+            sandbox=owner_state.get("sandbox"),
+            workspace=workspace or owner_state.get("workspace"),
+        )
+        thread_id = None
+    update_state(delegate_state_key, **updates)
+
+    try:
+        threading.Thread(
+            target=run_turn,
+            args=(runtime, [{"type": "text", "text": text}], thread_id, []),
+            daemon=True,
+        ).start()
+    except Exception as exc:
+        with process_lock:
+            runtime.busy = False
+        _delegate_error(chat_id, f"Не удалось запустить делегированную задачу: {compact(str(exc), 500)}")
+        return False
+    return True
+
+
 def start_account_login(runtime):
     if runtime.chat_id == OWNER_ID:
         send_plain(runtime.chat_id, "Владелец использует основной аккаунт ~/.codex; отдельный вход не требуется.")
@@ -1899,7 +2038,7 @@ def start_account_login(runtime):
             "account/login/start", {"type": "chatgptDeviceCode"}, timeout=60,
         ) or {}
         runtime.login_id = result.get("loginId")
-        update_state(runtime.chat_id, account_status="awaiting_login")
+        update_state(runtime.state_key, account_status="awaiting_login")
         send_plain(
             runtime.chat_id,
             "🔐 Подключение отдельного аккаунта Codex\n\n"
@@ -1909,7 +2048,7 @@ def start_account_login(runtime):
             "Бот сообщит, когда вход завершится.",
         )
     except Exception as exc:
-        update_state(runtime.chat_id, account_status="login_failed")
+        update_state(runtime.state_key, account_status="login_failed")
         send_plain(runtime.chat_id, f"Не удалось начать вход в Codex: {compact(str(exc), 500)}")
 
 
@@ -1918,9 +2057,9 @@ def account_status_report(runtime):
         result = get_app_server(runtime).request("account/read", {"refreshToken": False}, timeout=30) or {}
         account = result.get("account") or {}
         if not account:
-            update_state(runtime.chat_id, account_status=None)
+            update_state(runtime.state_key, account_status=None)
             return "Аккаунт Codex не подключён. Используй /login."
-        update_state(runtime.chat_id, account_status="ready")
+        update_state(runtime.state_key, account_status="ready")
         label = account.get("email") or account.get("type") or "подключён"
         plan = account.get("planType") or account.get("plan_type")
         return f"Аккаунт: {label}" + (f"\nПлан: {plan}" if plan else "")
@@ -1936,15 +2075,16 @@ def account_is_ready(runtime):
             "account/read", {"refreshToken": False}, timeout=30,
         ) or {}
         ready = bool(result.get("account"))
-        update_state(runtime.chat_id, account_status="ready" if ready else None)
+        update_state(runtime.state_key, account_status="ready" if ready else None)
         return ready
     except Exception as exc:
         log(f"tenant={runtime.chat_id} account readiness check failed: {exc}")
         return False
 
 
-def handle_command(chat_id, command):
-    runtime = get_tenant(chat_id)
+def handle_command(chat_id, command, runtime=None):
+    runtime = runtime or get_tenant(chat_id)
+    state_key = runtime.state_key
     raw_cmd, _, arg = command.partition(" ")
     cmd = raw_cmd.split("@", 1)[0].lower().lstrip("/.")
     arg = arg.strip()
@@ -1962,11 +2102,11 @@ def handle_command(chat_id, command):
         return True
     if cmd == "new":
         stop_current_process(runtime)
-        update_state(chat_id, thread_id=None, last_usage=None, session_usage=None, context_window=None)
+        update_state(state_key, thread_id=None, last_usage=None, session_usage=None, context_window=None)
         send_plain(chat_id, "🆕 Текущий Codex-тред сброшен. Следующее сообщение начнёт новый.")
         return True
     if cmd == "sessions":
-        current = chat_state(chat_id).get("thread_id")
+        current = chat_state(state_key).get("thread_id")
         rows = []
         for path in session_files(chat_id)[:10]:
             sid, preview = session_info(path)
@@ -1980,7 +2120,7 @@ def handle_command(chat_id, command):
             send_plain(chat_id, "Укажи однозначный id/префикс: /resume <id>" if matches else "Сессия не найдена.")
         else:
             stop_current_process(runtime)
-            update_state(chat_id, thread_id=matches[0], last_usage=None, session_usage=None, context_window=None)
+            update_state(state_key, thread_id=matches[0], last_usage=None, session_usage=None, context_window=None)
             send_plain(chat_id, f"Продолжаю сессию {matches[0][:8]}.")
         return True
     if cmd == "status":
@@ -1989,7 +2129,7 @@ def handle_command(chat_id, command):
         except Exception as exc:
             log(f"Could not resolve model for status: {exc}")
         with state_lock:
-            snapshot = dict(chat_state(chat_id))
+            snapshot = dict(chat_state(state_key))
         send_plain(chat_id, "ℹ️ Статус\n"
                    f"Сессия: {(snapshot.get('thread_id') or 'нет')[:8]}\n"
                    f"Модель: {snapshot.get('model') or 'не определена'}\n"
@@ -2004,7 +2144,7 @@ def handle_command(chat_id, command):
         return True
     if cmd == "compact":
         with state_lock:
-            thread_id = chat_state(chat_id).get("thread_id")
+            thread_id = chat_state(state_key).get("thread_id")
         if not thread_id:
             send_plain(chat_id, "Нет активной сессии для сжатия.")
             return True
@@ -2036,10 +2176,10 @@ def handle_command(chat_id, command):
                 return True
             supported = [option.get("reasoningEffort") for option in
                          chosen.get("supportedReasoningEfforts", []) if isinstance(option, dict)]
-            current_effort = chat_state(chat_id).get("effort")
+            current_effort = chat_state(state_key).get("effort")
             effort = (current_effort if current_effort in supported else
                       chosen.get("defaultReasoningEffort") or (supported[0] if supported else None))
-            update_state(chat_id, model=model_key(chosen), effort=effort)
+            update_state(state_key, model=model_key(chosen), effort=effort)
             send_plain(chat_id, f"🧠 Модель: {chosen.get('displayName') or model_key(chosen)}\n"
                        f"Мощность: {effort or 'не поддерживается'}")
         except Exception as exc:
@@ -2063,7 +2203,7 @@ def handle_command(chat_id, command):
                 send_plain(chat_id, f"Мощность «{arg}» недоступна для {model_key(chosen)}.\n\n"
                            f"{render_effort_picker(runtime)}")
                 return True
-            update_state(chat_id, effort=effort)
+            update_state(state_key, effort=effort)
             send_plain(chat_id, f"⚡ Мощность {chosen.get('displayName') or model_key(chosen)}: {effort}")
         except Exception as exc:
             send_plain(chat_id, f"Не удалось получить уровни мощности: {compact(str(exc), 500)}")
@@ -2075,17 +2215,17 @@ def handle_command(chat_id, command):
         if arg not in aliases:
             send_plain(chat_id, "Использование: /mode read-only|workspace-write|full")
         else:
-            update_state(chat_id, sandbox=aliases[arg])
+            update_state(state_key, sandbox=aliases[arg])
             send_plain(chat_id, f"Sandbox: {aliases[arg]}.")
         return True
     if cmd == "workspace":
         path = CODEX_CWD if arg.lower() == "default" else os.path.abspath(os.path.expanduser(arg))
         if not arg:
-            send_plain(chat_id, f"Workspace: {chat_state(chat_id).get('workspace')}\nИспользование: /workspace <путь>|default")
+            send_plain(chat_id, f"Workspace: {chat_state(state_key).get('workspace')}\nИспользование: /workspace <путь>|default")
         elif not os.path.isdir(path):
             send_plain(chat_id, f"Директория не существует: {path}")
         else:
-            update_state(chat_id, workspace=path)
+            update_state(state_key, workspace=path)
             send_plain(chat_id, f"Workspace: {path}")
         return True
     if cmd == "restart":
@@ -2146,7 +2286,7 @@ def handle_message(message):
         if chat_id:
             send_plain(chat_id, "⛔ Доступ к Codex-боту не разрешён. Попроси владельца добавить твой Telegram ID в whitelist.txt.")
         return
-    runtime = get_tenant(chat_id)
+    owner_runtime = get_tenant(chat_id)
     raw_text = (
         message.get("text")
         or message.get("caption")
@@ -2168,9 +2308,12 @@ def handle_message(message):
     # message beginning with /new or /stop would execute that command instead
     # of sending the forwarded content to Codex.
     if text.startswith(("/", ".")) and not forwarded and not rich_message:
-        handle_command(chat_id, text)
+        command_name = text.split(None, 1)[0].split("@", 1)[0].lstrip("/.").lower()
+        command_runtime = active_delegate_tenant(chat_id) if command_name == "stop" else None
+        handle_command(chat_id, text, runtime=command_runtime)
         return
-    account_status = chat_state(chat_id).get("account_status")
+    runtime = active_delegate_tenant(chat_id) or owner_runtime
+    account_status = chat_state(runtime.state_key).get("account_status")
     if chat_id != OWNER_ID and account_status != "ready" and not account_is_ready(runtime):
         if account_status == "awaiting_login":
             send_plain(chat_id, "Сначала заверши вход в Codex по ранее выданной ссылке.")

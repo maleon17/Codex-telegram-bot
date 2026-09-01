@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import os
 import sys
 import tempfile
@@ -13,6 +14,8 @@ os.environ.setdefault("TELEGRAM_BOT_TOKEN", "123456:test")
 os.environ.setdefault("OWNER_ID", "1")
 os.environ["CODEX_BOT_STATE_FILE"] = str(Path(TEMP.name) / "state.json")
 sys.path.insert(0, str(ROOT))
+import bridge_exec
+
 spec = importlib.util.spec_from_file_location("codex_telegram_bot", ROOT / "bot.py")
 bot = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(bot)
@@ -348,6 +351,170 @@ class RenderingTests(unittest.TestCase):
                 self.assertNotIn("private-thread", rendered)
                 self.assertNotIn('"type":', rendered)
                 self.assertLess(len(rendered), 4000)
+
+
+class DelegationTests(unittest.TestCase):
+    def setUp(self):
+        self.owner = bot.get_tenant(bot.OWNER_ID)
+        self.delegate = bot.get_delegate_tenant(bot.OWNER_ID)
+        with bot.process_lock:
+            self.owner.busy = False
+            self.owner.pending_batch = []
+            self.delegate.busy = False
+            self.delegate.pending_batch = []
+        bot.update_state(
+            bot.OWNER_ID,
+            thread_id=None,
+            model=None,
+            effort=None,
+            sandbox=bot.CODEX_SANDBOX,
+            workspace=bot.CODEX_CWD,
+            last_usage=None,
+            session_usage=None,
+            context_window=None,
+            pending_delegator_session_id=None,
+        )
+        bot.update_state(
+            self.delegate.state_key,
+            thread_id=None,
+            model=None,
+            effort=None,
+            sandbox=bot.CODEX_SANDBOX,
+            workspace=bot.CODEX_CWD,
+            last_usage=None,
+            session_usage=None,
+            context_window=None,
+            pending_delegator_session_id=None,
+        )
+
+    def tearDown(self):
+        with bot.process_lock:
+            self.owner.busy = False
+            self.delegate.busy = False
+            self.owner.pending_batch = []
+            self.delegate.pending_batch = []
+        for path in (
+            Path(bridge_exec.last_turn_path(bot.OWNER_ID)),
+            Path(bridge_exec.last_turn_path(bot.OWNER_ID, delegated=True)),
+        ):
+            path.unlink(missing_ok=True)
+
+    def test_delegate_runtime_keeps_real_chat_id_but_is_not_owner_runtime(self):
+        self.assertIsNot(self.delegate, self.owner)
+        self.assertEqual(self.delegate.chat_id, bot.OWNER_ID)
+        self.assertEqual(self.delegate.state_key, f"delegate:{bot.OWNER_ID}")
+
+    def test_default_delegate_is_fresh_and_does_not_mutate_owner_state(self):
+        bot.update_state(
+            bot.OWNER_ID,
+            thread_id="owner-thread",
+            model="owner-model",
+            effort="high",
+            sandbox="workspace-write",
+            workspace="/owner-workspace",
+        )
+        launched = []
+
+        class FakeThread:
+            def __init__(self, target, args=(), daemon=None):
+                launched.append((target, args, daemon))
+
+            def start(self):
+                pass
+
+        with patch.object(bot.threading, "Thread", FakeThread):
+            self.assertTrue(bot.start_delegate_turn(bot.OWNER_ID, "изолированная задача"))
+
+        owner_state = dict(bot.chat_state(bot.OWNER_ID))
+        delegate_state = dict(bot.chat_state(self.delegate.state_key))
+        self.assertIs(launched[0][1][0], self.delegate)
+        self.assertIsNone(launched[0][1][2])
+        self.assertEqual(self.delegate.chat_id, bot.OWNER_ID)
+        self.assertEqual(owner_state["thread_id"], "owner-thread")
+        self.assertEqual(owner_state["workspace"], "/owner-workspace")
+        self.assertIsNone(delegate_state["thread_id"])
+        self.assertEqual(delegate_state["model"], "owner-model")
+        self.assertEqual(delegate_state["sandbox"], "workspace-write")
+        self.assertEqual(delegate_state["workspace"], "/owner-workspace")
+        self.assertEqual(delegate_state["pending_delegator_session_id"], "owner-thread")
+
+    def test_resume_accepts_only_the_previous_delegate_thread(self):
+        bot.update_state(bot.OWNER_ID, thread_id="owner-thread")
+        bot.update_state(self.delegate.state_key, thread_id="delegate-thread-full")
+        launched = []
+
+        class FakeThread:
+            def __init__(self, target, args=(), daemon=None):
+                launched.append(args)
+
+            def start(self):
+                pass
+
+        with patch.object(bot.threading, "Thread", FakeThread):
+            self.assertTrue(
+                bot.start_delegate_turn(
+                    bot.OWNER_ID, "продолжение", resume_thread_id="delegate-th"
+                )
+            )
+        self.assertEqual(launched[0][2], "delegate-thread-full")
+        self.assertEqual(bot.chat_state(bot.OWNER_ID)["thread_id"], "owner-thread")
+
+        self.delegate.busy = False
+        messages = []
+        with patch.object(bot, "send_plain", side_effect=lambda chat_id, text: messages.append(text)):
+            self.assertFalse(
+                bot.start_delegate_turn(
+                    bot.OWNER_ID, "чужой тред", resume_thread_id="owner-th"
+                )
+            )
+        self.assertTrue(any("Нельзя продолжить" in message for message in messages))
+
+    def test_owner_message_steers_busy_delegate(self):
+        self.delegate.busy = True
+        routed = []
+        with patch.object(
+            bot,
+            "queue_message",
+            side_effect=lambda runtime, inputs, paths: routed.append((runtime, inputs, paths)),
+        ):
+            bot.handle_message({
+                "chat": {"id": bot.OWNER_ID},
+                "from": {"id": bot.OWNER_ID},
+                "text": "это steering для делегации",
+            })
+        self.assertEqual(len(routed), 1)
+        self.assertIs(routed[0][0], self.delegate)
+
+    def test_delegate_completion_keeps_owner_thread_and_uses_delegate_signal(self):
+        bot.update_state(bot.OWNER_ID, thread_id="owner-thread")
+        bot.update_state(
+            self.delegate.state_key,
+            thread_id="delegate-thread",
+            pending_delegator_session_id="owner-thread",
+        )
+        view = bot.TurnView(bot.OWNER_ID, state_key=self.delegate.state_key)
+        view.items = [{"type": "agent_message", "text": "готово"}]
+        with patch.object(bot, "send_rich"):
+            view.deliver()
+
+        self.assertEqual(bot.chat_state(bot.OWNER_ID)["thread_id"], "owner-thread")
+        self.assertEqual(bot.chat_state(self.delegate.state_key)["thread_id"], "delegate-thread")
+        self.assertIsNone(bot.chat_state(self.delegate.state_key)["pending_delegator_session_id"])
+        self.assertEqual(
+            json.loads(
+                Path(bridge_exec.last_turn_path(bot.OWNER_ID, delegated=True)).read_text()
+            )["text"],
+            "готово\n\nТвой session id (до делегации): `owner-th`. Продолжить делегированную: `/resume delegate`",
+        )
+
+    def test_bridge_exec_uses_a_signal_separate_from_owner_turns(self):
+        bot.write_last_turn(bot.OWNER_ID, "owner", delegated=False)
+        bot.write_last_turn(bot.OWNER_ID, "delegate", delegated=True)
+        owner_path = Path(bridge_exec.last_turn_path(bot.OWNER_ID))
+        delegate_path = Path(bridge_exec.last_turn_path(bot.OWNER_ID, delegated=True))
+        self.assertNotEqual(owner_path, delegate_path)
+        self.assertEqual(json.loads(owner_path.read_text())["text"], "owner")
+        self.assertEqual(json.loads(delegate_path.read_text())["text"], "delegate")
 
 
 class ModelCommandTests(unittest.TestCase):

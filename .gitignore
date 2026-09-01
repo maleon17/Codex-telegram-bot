@@ -4,6 +4,7 @@ state.json
 restart.request
 last_turn_*.json
 external_request.json
+external_request.json.delegate.lock
 accounts/
 whitelist.txt
 .env
