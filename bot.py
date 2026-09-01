@@ -1015,7 +1015,20 @@ class TurnView:
                 )
             else:
                 answer += f"\n\nПродолжить делегированную сессию: `/resume {thread_id[:8]}`"
-            update_state(self.chat_id, pending_delegator_session_id=None)
+            # The delegated thread is live only for this one turn -- restore
+            # the owner's own pre-delegation thread right away so their next
+            # ordinary Telegram message continues their own conversation,
+            # not the delegated one. `/resume <id>` above (looked up from
+            # session files on disk, not from this state) still works if
+            # they want to actually continue the delegated thread instead.
+            update_state(
+                self.chat_id,
+                pending_delegator_session_id=None,
+                thread_id=prior_thread_id or None,
+                last_usage=None,
+                session_usage=None,
+                context_window=None,
+            )
         write_last_turn(self.chat_id, answer)
 
         if process_items:
