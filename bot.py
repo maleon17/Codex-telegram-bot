@@ -77,6 +77,9 @@ WHITELIST_FILE = Path(os.environ.get(
 ACCOUNTS_DIR = Path(os.environ.get(
     "CODEX_BOT_ACCOUNTS_DIR", Path(__file__).with_name("accounts")
 )).expanduser()
+EXTERNAL_REQUEST_FILE = Path(os.environ.get(
+    "CODEX_BOT_EXTERNAL_REQUEST_FILE", Path(__file__).with_name("external_request.json")
+)).expanduser()
 
 state_lock = threading.RLock()
 process_lock = threading.RLock()
@@ -414,6 +417,7 @@ def chat_state(chat_id):
         entry.setdefault("session_usage", None)
         entry.setdefault("context_window", None)
         entry.setdefault("account_status", "ready" if int(chat_id) == OWNER_ID else None)
+        entry.setdefault("pending_delegator_session_id", None)
         return entry
 
 
@@ -427,6 +431,22 @@ def update_runtime_state(**values):
     with state_lock:
         state_db.setdefault("runtime", {}).update(values)
         _save_state_locked()
+
+
+def write_last_turn(chat_id, text):
+    """Signal a completed turn's final text via a plain file instead of
+    Telegram's getUpdates -- this process already owns that bot token's
+    getUpdates stream exclusively (only one consumer can ever see a given
+    update), so an external script polling the same API would just starve.
+    bridge_exec.py polls this file instead."""
+    path = STATE_FILE.with_name(f"last_turn_{chat_id}.json")
+    tmp = path.with_suffix(".tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"text": text, "ts": time.time()}, f)
+        os.replace(tmp, path)
+    except OSError as exc:
+        log(f"write_last_turn failed: {exc}")
 
 
 def _save_state_locked():
@@ -975,6 +995,20 @@ class TurnView:
             answer += f"\n\nТокены: {format_usage(self.usage)}"
         if self.context_notice:
             answer += f"\n\n{self.context_notice}"
+        with state_lock:
+            thread_id = chat_state(self.chat_id).get("thread_id")
+            delegator_session_id = chat_state(self.chat_id).get("pending_delegator_session_id")
+        # Delegation-only footer, not a per-message one (per the owner
+        # directly): only present when this turn was actually kicked off
+        # via external_request_watcher(), and one-shot -- cleared right
+        # after use so it doesn't leak onto the next, ordinary turn.
+        if delegator_session_id and thread_id:
+            answer += (
+                f"\n\nТвой session id: `{delegator_session_id[:8]}`. "
+                f"Продолжить: `/resume {thread_id[:8]}`"
+            )
+            update_state(self.chat_id, pending_delegator_session_id=None)
+        write_last_turn(self.chat_id, answer)
 
         if process_items:
             process_steps = [
@@ -1620,6 +1654,52 @@ def restart_watcher():
         return
 
 
+def external_request_watcher():
+    """Local, non-Telegram input channel for bridge_exec.py. A bot can
+    never see its own outgoing messages via getUpdates -- Telegram simply
+    does not deliver them back to the sender, confirmed live 2026-09-01,
+    not something fixable at the code level. Since this whole product is
+    code we control, the actual fix is to skip Telegram for this leg
+    entirely: bridge_exec.py writes a request file here instead of
+    pretending to be an incoming message, and this feeds it straight into
+    queue_message() -- the exact same entry point a real Telegram message
+    reaches after handle_message() parses it -- so busy handling, real
+    turn/steer, and everything else downstream behaves identically
+    regardless of which channel the text came in on."""
+    while True:
+        time.sleep(1)
+        if not EXTERNAL_REQUEST_FILE.exists():
+            continue
+        try:
+            request = json.loads(EXTERNAL_REQUEST_FILE.read_text(encoding="utf-8"))
+        except Exception as exc:
+            log(f"Could not read external request: {exc}")
+            request = None
+        try:
+            EXTERNAL_REQUEST_FILE.unlink()
+        except FileNotFoundError:
+            pass
+        if not isinstance(request, dict):
+            continue
+        chat_id = request.get("chat_id") or OWNER_ID
+        text = request.get("text")
+        if not text:
+            continue
+        runtime = get_tenant(chat_id)
+        if request.get("workspace"):
+            update_state(chat_id, workspace=request["workspace"])
+        if request.get("resume_thread_id"):
+            update_state(chat_id, thread_id=request["resume_thread_id"])
+        # Marks the NEXT completed turn as delegated so its footer carries
+        # the delegator's own session id (see the footer code in run_turn's
+        # finalize step) -- ordinary human-typed turns never set this, so
+        # they never get that footer at all, per the owner directly: the
+        # id/resume footer is a delegation mechanism, not a per-message one.
+        if request.get("delegator_session_id"):
+            update_state(chat_id, pending_delegator_session_id=request["delegator_session_id"])
+        queue_message(runtime, [{"type": "text", "text": text}])
+
+
 def stop_current_process(runtime):
     with process_lock:
         client = runtime.app_server
@@ -2110,6 +2190,7 @@ def main():
     except Exception as exc:
         log(f"Codex app-server warm start failed; will retry on first message: {exc}")
     threading.Thread(target=restart_watcher, daemon=True).start()
+    threading.Thread(target=external_request_watcher, daemon=True).start()
     log(f"Codex Telegram bot started; owner={OWNER_ID}, cwd={CODEX_CWD}")
     while True:
         params = {"timeout": 30, "allowed_updates": ["message"]}
