@@ -20,7 +20,7 @@ a couple of helper scripts but no import-level coupling:
 
 - **Codex bot (this repo)** — https://github.com/maleon17/Codex-telegram-bot
   Interactive Codex ↔ Telegram bot, one `app-server` per user.
-- **Claude bridge** — https://github.com/maleon17/Claude-telegram-module
+- **Claude bridge** — https://github.com/maleon17/Claude-telegram-bot
   The same idea for Claude Code: a persistent `claude -p` stream-json process
   per chat, Bot-API bot.
 - **CodexAsk userbot** — https://github.com/maleon17/Codex-jarvis
