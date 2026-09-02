@@ -1,6 +1,6 @@
 [Unit]
 Description=Codex Telegram Bot
-Documentation=https://github.com/maleon17/Codex-telegram-bot
+Documentation=https://github.com/maleon17/codex-telegram-bridge
 After=network-online.target
 Wants=network-online.target
 

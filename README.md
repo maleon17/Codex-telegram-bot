@@ -1,4 +1,6 @@
-# Codex Telegram Bot
+# codex-telegram-bridge
+
+> Part of **[telegram-ai](https://github.com/maleon17/telegram-ai)** — Claude/Codex ↔ Telegram, four ways.
 
 A persistent, multi-account Telegram frontend for [OpenAI Codex](https://developers.openai.com/codex/).
 It uses your ChatGPT/Codex subscription through the installed Codex CLI—no
@@ -35,8 +37,8 @@ collapsible process log.
 ## Quick install
 
 ```bash
-git clone https://github.com/maleon17/Codex-telegram-bot.git
-cd Codex-telegram-bot
+git clone https://github.com/maleon17/codex-telegram-bridge.git
+cd codex-telegram-bridge
 
 # Authenticate the owner's Codex account first.
 codex login
