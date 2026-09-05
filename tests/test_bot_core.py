@@ -1,4 +1,5 @@
 import importlib.util
+import io
 import json
 import os
 import sys
@@ -353,6 +354,110 @@ class RenderingTests(unittest.TestCase):
                 self.assertLess(len(rendered), 4000)
 
 
+class RuntimeIsolationTests(unittest.TestCase):
+    def test_delegate_home_is_separate_and_shares_auth_and_config_by_symlink(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            shared_home = root / "shared"
+            shared_home.mkdir()
+            for filename in ("auth.json", "config.toml"):
+                (shared_home / filename).write_text(filename, encoding="utf-8")
+            accounts_dir = root / "accounts"
+            runtime = bot.TenantRuntime(
+                bot.OWNER_ID, state_key=bot.delegate_key(bot.OWNER_ID),
+            )
+            with patch.object(bot, "ACCOUNTS_DIR", accounts_dir), \
+                    patch.dict(os.environ, {"CODEX_HOME": str(shared_home)}, clear=False):
+                delegate_home = bot.tenant_codex_home(
+                    runtime.chat_id, state_key=runtime.state_key,
+                )
+                self.assertNotEqual(delegate_home, shared_home)
+                for filename in ("auth.json", "config.toml"):
+                    link = delegate_home / filename
+                    self.assertTrue(link.is_symlink())
+                    self.assertEqual(link.resolve(), shared_home / filename)
+
+                (shared_home / "sessions").mkdir()
+                (delegate_home / "sessions").mkdir()
+                owner_session = shared_home / "sessions" / "owner.jsonl"
+                delegate_session = delegate_home / "sessions" / "delegate.jsonl"
+                owner_session.write_text("", encoding="utf-8")
+                delegate_session.write_text("", encoding="utf-8")
+                self.assertEqual(bot.session_files(bot.OWNER_ID), [owner_session])
+                self.assertEqual(bot.session_files(runtime), [delegate_session])
+
+                client = bot.get_app_server(runtime)
+                self.assertEqual(Path(client.env["CODEX_HOME"]), delegate_home)
+
+
+class ProcessEnvironmentTests(unittest.TestCase):
+    def test_app_server_env_keeps_codex_environment_but_blocks_bot_secrets(self):
+        inherited = {
+            "PATH": "/usr/bin",
+            "HOME": "/tmp/codex-home",
+            "LANG": "ru_RU.UTF-8",
+            "LC_ALL": "ru_RU.UTF-8",
+            "TERM": "xterm",
+            "CODEX_CLI_TEST": "keep-me",
+            "TELEGRAM_BOT_TOKEN": "telegram-secret",
+            "CODEX_BOT_STATE_FILE": "/tmp/state.json",
+            "CODEX_BOT_PRIVATE": "bot-secret",
+        }
+        with patch.dict(os.environ, inherited, clear=True):
+            runtime = bot.TenantRuntime(bot.OWNER_ID)
+            child_env = bot.get_app_server(runtime).env
+
+        for key, value in inherited.items():
+            if key.startswith("CODEX_BOT_") or key == "TELEGRAM_BOT_TOKEN":
+                self.assertNotIn(key, child_env)
+            else:
+                self.assertEqual(child_env[key], value)
+
+
+class BridgeExecTests(unittest.TestCase):
+    def test_repeated_env_flags_are_written_to_external_request(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            request_path = Path(temp_dir) / "external_request.json"
+            seen = {}
+
+            def fake_poll(chat_id, baseline_ts, timeout_s):
+                seen.update(json.loads(request_path.read_text(encoding="utf-8")))
+                request_path.unlink()
+                return {"text": "готово"}
+
+            argv = [
+                "bridge_exec.py", "--chat-id", "1",
+                "--env", "CLIENT_KEY=secret",
+                "--env", "REGION=eu=1",
+                "task",
+            ]
+            with patch.object(bridge_exec, "external_request_path", return_value=str(request_path)), \
+                    patch.object(bridge_exec, "poll_until_done", side_effect=fake_poll), \
+                    patch.object(sys, "argv", argv):
+                bridge_exec.main()
+
+            self.assertEqual(seen["env"], {"CLIENT_KEY": "secret", "REGION": "eu=1"})
+
+    def test_env_with_resume_fails_before_writing_external_request(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            request_path = Path(temp_dir) / "external_request.json"
+            stderr = io.StringIO()
+            argv = [
+                "bridge_exec.py", "--resume", "delegate-thread",
+                "--env", "CLIENT_KEY=secret", "task",
+            ]
+            with patch.object(bridge_exec, "external_request_path", return_value=str(request_path)), \
+                    patch.object(sys, "argv", argv), \
+                    patch.object(sys, "stderr", stderr):
+                with self.assertRaises(SystemExit) as raised:
+                    bridge_exec.main()
+
+            self.assertEqual(raised.exception.code, 1)
+            self.assertIn("--env", stderr.getvalue())
+            self.assertIn("--resume", stderr.getvalue())
+            self.assertFalse(request_path.exists())
+
+
 class DelegationTests(unittest.TestCase):
     MODEL_CATALOG = [
         {"id": "gpt-5.6-sol", "model": "gpt-5.6-sol", "displayName": "GPT-5.6-Sol",
@@ -414,6 +519,39 @@ class DelegationTests(unittest.TestCase):
         self.assertIsNot(self.delegate, self.owner)
         self.assertEqual(self.delegate.chat_id, bot.OWNER_ID)
         self.assertEqual(self.delegate.state_key, f"delegate:{bot.OWNER_ID}")
+
+    def test_delegate_env_is_consumed_once_and_never_enters_state(self):
+        class FakeThread:
+            def __init__(self, target, args=(), daemon=None):
+                pass
+
+            def start(self):
+                pass
+
+        with patch.object(bot.threading, "Thread", FakeThread):
+            self.assertTrue(bot.start_delegate_turn(
+                bot.OWNER_ID, "секретная задача", env={"CLIENT_SECRET": "secret"},
+            ))
+        self.assertEqual(self.delegate.pending_env, {"CLIENT_SECRET": "secret"})
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            shared_home = Path(temp_dir) / "shared"
+            shared_home.mkdir()
+            with patch.object(bot, "ACCOUNTS_DIR", Path(temp_dir) / "accounts"), \
+                    patch.dict(os.environ, {"CODEX_HOME": str(shared_home)}, clear=False):
+                client = bot.get_app_server(self.delegate)
+                self.assertIsNone(self.delegate.pending_env)
+                self.assertEqual(client.env["CLIENT_SECRET"], "secret")
+                self.assertEqual(
+                    Path(client.env["CODEX_HOME"]),
+                    Path(temp_dir) / "accounts" / "delegated" / str(bot.OWNER_ID),
+                )
+                self.assertTrue(self.delegate.close_app_server_after_turn)
+
+        self.assertNotIn("CLIENT_SECRET", json.dumps(bot.chat_state(self.delegate.state_key)))
+        with bot.process_lock:
+            self.delegate.app_server = None
+            self.delegate.close_app_server_after_turn = False
 
     def test_default_delegate_is_fresh_and_does_not_mutate_owner_state(self):
         bot.update_state(

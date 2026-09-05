@@ -129,6 +129,8 @@ class TenantRuntime:
         self.pending_batch = []
         self.batch_timer = None
         self.batch_generation = 0
+        self.pending_env = None
+        self.close_app_server_after_turn = False
 
 
 tenants = {}
@@ -178,8 +180,32 @@ def load_whitelist():
     return result
 
 
-def tenant_codex_home(chat_id):
-    if int(chat_id) == OWNER_ID:
+def default_codex_home():
+    return Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser()
+
+
+def tenant_codex_home(chat_id, state_key=None):
+    """Return a tenant home; delegates share auth/config, not session files."""
+    chat_id = int(chat_id)
+    delegated = state_key is not None and str(state_key) != str(chat_id)
+    if delegated:
+        path = ACCOUNTS_DIR / "delegated" / str(chat_id)
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        shared_home = tenant_codex_home(chat_id) or default_codex_home()
+        # Only these two files are shared. Sessions and every other file stay
+        # physically inside the delegated home above.
+        for filename in ("auth.json", "config.toml"):
+            link = path / filename
+            target = (shared_home / filename).absolute()
+            if link.is_symlink():
+                if os.path.realpath(link) == os.path.realpath(target):
+                    continue
+                link.unlink()
+            elif link.exists():
+                link.unlink()
+            link.symlink_to(target)
+        return path
+    if chat_id == OWNER_ID:
         return None
     path = ACCOUNTS_DIR / str(chat_id)
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -1123,13 +1149,30 @@ class TurnView:
             send_rich(self.chat_id, answer)
 
 
+def codex_process_env(runtime, extra_env=None):
+    # Keep the system/Codex environment intact, but never inherit bot secrets
+    # or control-plane variables from the bridge process.
+    env = {
+        key: value for key, value in os.environ.items()
+        if key != "TELEGRAM_BOT_TOKEN" and not key.startswith("CODEX_BOT_")
+    }
+    codex_home = tenant_codex_home(runtime.chat_id, state_key=runtime.state_key)
+    if codex_home is not None:
+        env["CODEX_HOME"] = str(codex_home)
+    if extra_env:
+        env.update(extra_env)
+        if codex_home is not None:
+            env["CODEX_HOME"] = str(codex_home)
+    return env
+
+
 def get_app_server(runtime):
     with process_lock:
         if runtime.app_server is None:
-            env = dict(os.environ)
-            codex_home = tenant_codex_home(runtime.chat_id)
-            if codex_home is not None:
-                env["CODEX_HOME"] = str(codex_home)
+            extra_env = runtime.pending_env
+            runtime.pending_env = None
+            env = codex_process_env(runtime, extra_env=extra_env)
+            runtime.close_app_server_after_turn = bool(extra_env)
             runtime.app_server = AppServerClient(
                 lambda method, params: handle_app_notification(runtime, method, params),
                 lambda message: log(f"tenant={runtime.chat_id} {message}"),
@@ -1438,6 +1481,7 @@ def run_turn(runtime, inputs, thread_id, media_paths=None):
     error = None
     stopped = False
     paths = []
+    close_after_turn_client = None
     try:
         client = get_app_server(runtime)
         client.start_if_needed()
@@ -1501,6 +1545,15 @@ def run_turn(runtime, inputs, thread_id, media_paths=None):
         view.deliver(error=compact(str(exc), 1000))
     finally:
         with process_lock:
+            if runtime.close_app_server_after_turn:
+                close_after_turn_client = runtime.app_server
+                runtime.app_server = None
+                runtime.loaded_thread_id = None
+                runtime.loaded_server_pid = None
+                if close_after_turn_client is not None:
+                    close_after_turn_client.close()
+            runtime.close_app_server_after_turn = False
+            runtime.pending_env = None
             runtime.active_view = None
             runtime.active_done = None
             runtime.active_turn_id = None
@@ -1567,9 +1620,14 @@ def run_compaction(runtime, thread_id):
             runtime.busy = False
 
 
-def session_files(chat_id=OWNER_ID):
-    codex_home = tenant_codex_home(chat_id)
-    root = (codex_home or Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))) / "sessions"
+def session_files(runtime_or_chat_id=OWNER_ID, state_key=None):
+    if isinstance(runtime_or_chat_id, TenantRuntime):
+        chat_id = runtime_or_chat_id.chat_id
+        state_key = runtime_or_chat_id.state_key
+    else:
+        chat_id = int(runtime_or_chat_id)
+    codex_home = tenant_codex_home(chat_id, state_key=state_key)
+    root = (codex_home or default_codex_home()) / "sessions"
     return sorted(root.glob("**/*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
 
 
@@ -1593,10 +1651,10 @@ def session_info(path):
     return sid, preview
 
 
-def session_message_count(chat_id, thread_id):
+def session_message_count(runtime_or_chat_id, thread_id, state_key=None):
     if not thread_id:
         return None
-    for path in session_files(chat_id):
+    for path in session_files(runtime_or_chat_id, state_key=state_key):
         sid, _ = session_info(path)
         if sid != thread_id:
             continue
@@ -1684,7 +1742,7 @@ def build_usage_report(runtime):
     except Exception as exc:
         usage_error = compact(str(exc), 300)
 
-    messages = session_message_count(chat_id, thread_id)
+    messages = session_message_count(runtime, thread_id)
     context_tokens = last.get("input_tokens")
     context_window = snapshot.get("context_window")
     context = f"~{fmt_number(context_tokens)} tokens" if context_tokens else "нет данных"
@@ -1830,6 +1888,7 @@ def external_request_watcher():
             workspace=request.get("workspace"),
             model=request.get("model"),
             effort=request.get("effort"),
+            env=request.get("env"),
         )
 
 
@@ -1998,11 +2057,12 @@ def _delegate_error(chat_id, message):
 
 
 def start_delegate_turn(chat_id, text, resume_thread_id=None, workspace=None,
-                        model=None, effort=None):
+                        model=None, effort=None, env=None):
     """Start a delegated turn in the real chat's isolated delegate tenant."""
     chat_id = int(chat_id)
     runtime = get_delegate_tenant(chat_id)
     requested_thread_id = str(resume_thread_id or "").strip() or None
+    requested_env = dict(env or {})
     delegate_state_key = runtime.state_key
 
     with state_lock:
@@ -2010,6 +2070,10 @@ def start_delegate_turn(chat_id, text, resume_thread_id=None, workspace=None,
         delegate_state = dict(chat_state(delegate_state_key))
     owner_thread_id = owner_state.get("thread_id")
     delegate_thread_id = delegate_state.get("thread_id")
+
+    if requested_thread_id and requested_env:
+        _delegate_error(chat_id, "Нельзя использовать --env вместе с --resume.")
+        return False
 
     if requested_thread_id:
         valid_delegate_thread = bool(
@@ -2100,7 +2164,18 @@ def start_delegate_turn(chat_id, text, resume_thread_id=None, workspace=None,
         thread_id = None
     if requested_settings is not None:
         updates["model"], updates["effort"] = requested_settings
+    if requested_env:
+        with process_lock:
+            old_client = runtime.app_server
+            runtime.app_server = None
+            runtime.loaded_thread_id = None
+            runtime.loaded_server_pid = None
+        if old_client is not None:
+            old_client.close()
     update_state(delegate_state_key, **updates)
+    if requested_env:
+        with process_lock:
+            runtime.pending_env = requested_env
 
     try:
         threading.Thread(
@@ -2111,6 +2186,8 @@ def start_delegate_turn(chat_id, text, resume_thread_id=None, workspace=None,
     except Exception as exc:
         with process_lock:
             runtime.busy = False
+            runtime.pending_env = None
+            runtime.close_app_server_after_turn = False
         _delegate_error(chat_id, f"Не удалось запустить делегированную задачу: {compact(str(exc), 500)}")
         return False
     return True
@@ -2197,13 +2274,13 @@ def handle_command(chat_id, command, runtime=None):
     if cmd == "sessions":
         current = chat_state(state_key).get("thread_id")
         rows = []
-        for path in session_files(chat_id)[:10]:
+        for path in session_files(runtime)[:10]:
             sid, preview = session_info(path)
             rows.append(f"{sid[:8]}{' ← текущая' if sid == current else ''}  {preview}")
         send_plain(chat_id, "Последние сессии:\n" + ("\n".join(rows) or "не найдены"))
         return True
     if cmd == "resume":
-        matches = [sid for path in session_files(chat_id) for sid, _ in [session_info(path)]
+        matches = [sid for path in session_files(runtime) for sid, _ in [session_info(path)]
                    if arg and sid.startswith(arg)]
         if len(matches) != 1:
             send_plain(chat_id, "Укажи однозначный id/префикс: /resume <id>" if matches else "Сессия не найдена.")

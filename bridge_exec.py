@@ -17,6 +17,7 @@ actual product for free -- only the INPUT side bypasses Telegram now.
 Usage:
     bridge_exec.py [--workspace PATH] [--resume ID] [--chat-id ID]
                     [--timeout SECONDS] [--model KEY] [--effort LEVEL]
+                    [--env KEY=VALUE ...]
                     PROMPT...
 
 Every call through this script is a delegated turn by definition, so the
@@ -100,6 +101,16 @@ def delegate_lock_path(request_path):
     return request_path + ".delegate.lock"
 
 
+def parse_env_assignments(assignments):
+    result = {}
+    for assignment in assignments:
+        key, separator, value = assignment.partition("=")
+        if not separator or not key:
+            raise ValueError("--env expects KEY=VALUE")
+        result[key] = value
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workspace", help="switch workspace before the prompt")
@@ -108,8 +119,19 @@ def main():
     parser.add_argument("--timeout", type=int, default=1800)
     parser.add_argument("--model", help="select a model by key, id or display name")
     parser.add_argument("--effort", help="select a reasoning effort supported by the model")
+    parser.add_argument("--env", action="append", default=[], metavar="KEY=VALUE",
+                        help="pass one environment variable to a fresh delegated turn; repeatable")
     parser.add_argument("prompt", nargs="+")
     args = parser.parse_args()
+
+    if args.resume and args.env:
+        print("--env нельзя использовать вместе с --resume.", file=sys.stderr)
+        sys.exit(1)
+    try:
+        requested_env = parse_env_assignments(args.env)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(1)
 
     env = load_dotenv()
     chat_id = args.chat_id or int(env.get("OWNER_ID") or os.environ.get("OWNER_ID") or DEFAULT_OWNER_ID)
@@ -144,6 +166,8 @@ def main():
             request["model"] = args.model
         if args.effort is not None:
             request["effort"] = args.effort
+        if requested_env:
+            request["env"] = requested_env
         # Every request through this file channel is a delegated one by
         # definition (a human never writes this file). The server owns the
         # delegate-only state and footer; this file carries only turn inputs
