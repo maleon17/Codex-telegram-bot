@@ -16,7 +16,8 @@ actual product for free -- only the INPUT side bypasses Telegram now.
 
 Usage:
     bridge_exec.py [--workspace PATH] [--resume ID] [--chat-id ID]
-                    [--timeout SECONDS] PROMPT...
+                    [--timeout SECONDS] [--model KEY] [--effort LEVEL]
+                    PROMPT...
 
 Every call through this script is a delegated turn by definition, so the
 final answer's footer always notes it -- the OWNER's own thread from
@@ -90,7 +91,7 @@ def poll_until_done(chat_id, baseline_ts, timeout_s, poll_interval=2):
         except (FileNotFoundError, json.JSONDecodeError):
             data = None
         if data and data.get("ts", 0) > baseline_ts:
-            return data["text"]
+            return data
         time.sleep(poll_interval)
     raise TimeoutError(f'No completed turn signalled via {path} within {timeout_s}s.')
 
@@ -105,6 +106,8 @@ def main():
     parser.add_argument("--resume", help="resume this thread id before the prompt")
     parser.add_argument("--chat-id", type=int, help="override the target chat (default: OWNER_ID)")
     parser.add_argument("--timeout", type=int, default=1800)
+    parser.add_argument("--model", help="select a model by key, id or display name")
+    parser.add_argument("--effort", help="select a reasoning effort supported by the model")
     parser.add_argument("prompt", nargs="+")
     args = parser.parse_args()
 
@@ -137,9 +140,14 @@ def main():
             request["workspace"] = args.workspace
         if args.resume:
             request["resume_thread_id"] = args.resume
+        if args.model is not None:
+            request["model"] = args.model
+        if args.effort is not None:
+            request["effort"] = args.effort
         # Every request through this file channel is a delegated one by
         # definition (a human never writes this file). The server owns the
-        # delegate-only state and footer, so the request JSON stays unchanged.
+        # delegate-only state and footer; this file carries only turn inputs
+        # and explicit per-turn overrides.
 
         tmp = request_path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
@@ -147,12 +155,15 @@ def main():
         os.replace(tmp, request_path)
 
         try:
-            final_text = poll_until_done(chat_id, baseline_ts, args.timeout)
+            result = poll_until_done(chat_id, baseline_ts, args.timeout)
         except TimeoutError as exc:
             print(str(exc), file=sys.stderr)
             sys.exit(1)
 
-    print(final_text)
+    if result.get("ok") is False:
+        print(result.get("text") or "Делегированная задача завершилась ошибкой.", file=sys.stderr)
+        sys.exit(1)
+    print(result.get("text", ""))
 
 
 if __name__ == "__main__":

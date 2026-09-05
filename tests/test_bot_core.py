@@ -354,6 +354,17 @@ class RenderingTests(unittest.TestCase):
 
 
 class DelegationTests(unittest.TestCase):
+    MODEL_CATALOG = [
+        {"id": "gpt-5.6-sol", "model": "gpt-5.6-sol", "displayName": "GPT-5.6-Sol",
+         "isDefault": True, "supportedReasoningEfforts": [
+             {"reasoningEffort": "low"}, {"reasoningEffort": "high"},
+         ]},
+        {"id": "gpt-5.6-luna", "model": "gpt-5.6-luna", "displayName": "GPT-5.6-Luna",
+         "isDefault": False, "supportedReasoningEfforts": [
+             {"reasoningEffort": "high"},
+         ]},
+    ]
+
     def setUp(self):
         self.owner = bot.get_tenant(bot.OWNER_ID)
         self.delegate = bot.get_delegate_tenant(bot.OWNER_ID)
@@ -437,6 +448,100 @@ class DelegationTests(unittest.TestCase):
         self.assertEqual(delegate_state["sandbox"], "workspace-write")
         self.assertEqual(delegate_state["workspace"], "/owner-workspace")
         self.assertEqual(delegate_state["pending_delegator_session_id"], "owner-thread")
+
+    def test_delegate_model_and_effort_are_applied_before_thread_start(self):
+        launched = []
+        delegate = self.delegate
+
+        class FakeThread:
+            def __init__(self, target, args=(), daemon=None):
+                launched.append(dict(bot.chat_state(delegate.state_key)))
+
+            def start(self):
+                pass
+
+        with patch.object(bot, "available_models", return_value=self.MODEL_CATALOG):
+            with patch.object(bot.threading, "Thread", FakeThread):
+                self.assertTrue(bot.start_delegate_turn(
+                    bot.OWNER_ID,
+                    "настройки до старта",
+                    model="GPT-5.6-Luna",
+                    effort="HIGH",
+                ))
+
+        self.assertEqual(launched[0]["model"], "gpt-5.6-luna")
+        self.assertEqual(launched[0]["effort"], "high")
+
+    def test_delegate_effort_without_model_uses_current_model(self):
+        bot.update_state(bot.OWNER_ID, model="gpt-5.6-sol", effort="low")
+        launched = []
+        delegate = self.delegate
+
+        class FakeThread:
+            def __init__(self, target, args=(), daemon=None):
+                launched.append(dict(bot.chat_state(delegate.state_key)))
+
+            def start(self):
+                pass
+
+        with patch.object(bot, "available_models", return_value=self.MODEL_CATALOG):
+            with patch.object(bot.threading, "Thread", FakeThread):
+                self.assertTrue(bot.start_delegate_turn(
+                    bot.OWNER_ID, "только effort", effort="HIGH"
+                ))
+
+        self.assertEqual(launched[0]["model"], "gpt-5.6-sol")
+        self.assertEqual(launched[0]["effort"], "high")
+
+    def test_invalid_delegate_model_fails_without_starting_thread(self):
+        launched = []
+        messages = []
+
+        class FakeThread:
+            def __init__(self, *args, **kwargs):
+                launched.append(True)
+
+            def start(self):
+                pass
+
+        with patch.object(bot, "available_models", return_value=self.MODEL_CATALOG):
+            with patch.object(bot, "send_plain", side_effect=lambda chat_id, text: messages.append(text)):
+                with patch.object(bot.threading, "Thread", FakeThread):
+                    self.assertFalse(bot.start_delegate_turn(
+                        bot.OWNER_ID, "не запускать", model="missing-model"
+                    ))
+
+        self.assertEqual(launched, [])
+        self.assertIn("Модель", messages[-1])
+        signal = json.loads(
+            Path(bridge_exec.last_turn_path(bot.OWNER_ID, delegated=True)).read_text()
+        )
+        self.assertFalse(signal["ok"])
+
+    def test_invalid_delegate_effort_fails_without_starting_thread(self):
+        launched = []
+        messages = []
+
+        class FakeThread:
+            def __init__(self, *args, **kwargs):
+                launched.append(True)
+
+            def start(self):
+                pass
+
+        with patch.object(bot, "available_models", return_value=self.MODEL_CATALOG):
+            with patch.object(bot, "send_plain", side_effect=lambda chat_id, text: messages.append(text)):
+                with patch.object(bot.threading, "Thread", FakeThread):
+                    self.assertFalse(bot.start_delegate_turn(
+                        bot.OWNER_ID, "не запускать", effort="minimal"
+                    ))
+
+        self.assertEqual(launched, [])
+        self.assertIn("Мощность", messages[-1])
+        signal = json.loads(
+            Path(bridge_exec.last_turn_path(bot.OWNER_ID, delegated=True)).read_text()
+        )
+        self.assertFalse(signal["ok"])
 
     def test_resume_accepts_only_the_previous_delegate_thread(self):
         bot.update_state(bot.OWNER_ID, thread_id="owner-thread")

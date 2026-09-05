@@ -473,7 +473,7 @@ def update_runtime_state(**values):
         _save_state_locked()
 
 
-def write_last_turn(chat_id, text, delegated=False):
+def write_last_turn(chat_id, text, delegated=False, ok=None):
     """Signal a completed turn's final text via a plain file instead of
     Telegram's getUpdates -- this process already owns that bot token's
     getUpdates stream exclusively (only one consumer can ever see a given
@@ -487,8 +487,11 @@ def write_last_turn(chat_id, text, delegated=False):
     path = STATE_FILE.with_name(filename)
     tmp = path.with_suffix(".tmp")
     try:
+        signal = {"text": text, "ts": time.time()}
+        if ok is not None:
+            signal["ok"] = bool(ok)
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"text": text, "ts": time.time()}, f)
+            json.dump(signal, f)
         os.replace(tmp, path)
     except OSError as exc:
         log(f"write_last_turn failed: {exc}")
@@ -1280,28 +1283,88 @@ def model_key(model):
     return str(model.get("model") or model.get("id") or "")
 
 
-def selected_model(runtime, models=None, persist=True):
-    models = models if models is not None else available_models(runtime)
-    with state_lock:
-        snapshot = dict(chat_state(runtime.state_key))
-    current = snapshot.get("model")
+def resolve_model_choice(models, value):
+    wanted = str(value or "").strip().lower()
+    if not wanted:
+        return None
+    return next((model for model in models if wanted in {
+        model_key(model).lower(),
+        str(model.get("id") or "").lower(),
+        str(model.get("displayName") or "").lower(),
+    }), None)
+
+
+def effort_options(model):
+    return [option for option in model.get("supportedReasoningEfforts", [])
+            if isinstance(option, dict) and option.get("reasoningEffort")]
+
+
+def supported_reasoning_efforts(model):
+    return [option.get("reasoningEffort") for option in
+            model.get("supportedReasoningEfforts", []) if isinstance(option, dict)]
+
+
+def resolve_effort_choice(model, value):
+    wanted = str(value or "").strip().lower()
+    if not wanted:
+        return None
+    return next((effort for effort in supported_reasoning_efforts(model)
+                 if effort and str(effort).lower() == wanted), None)
+
+
+def select_model_from_catalog(models, current=None):
     chosen = next((model for model in models if model_key(model) == current), None)
     if chosen is None:
         chosen = next((model for model in models if model.get("isDefault")), None)
     if chosen is None and models:
         chosen = models[0]
+    return chosen
+
+
+def selected_model(runtime, models=None, persist=True):
+    models = models if models is not None else available_models(runtime)
+    with state_lock:
+        snapshot = dict(chat_state(runtime.state_key))
+    current = snapshot.get("model")
+    chosen = select_model_from_catalog(models, current)
     if chosen and persist:
         updates = {}
         key = model_key(chosen)
         if current != key:
             updates["model"] = key
-        supported = [option.get("reasoningEffort") for option in
-                     chosen.get("supportedReasoningEfforts", []) if isinstance(option, dict)]
+        supported = supported_reasoning_efforts(chosen)
         if snapshot.get("effort") not in supported:
             updates["effort"] = chosen.get("defaultReasoningEffort") or (supported[0] if supported else None)
         if updates:
             update_state(runtime.state_key, **updates)
     return chosen
+
+
+def resolve_delegate_settings(runtime, current_model=None, current_effort=None,
+                              requested_model=None, requested_effort=None):
+    """Resolve explicit model settings against the delegate's live catalog."""
+    models = available_models(runtime)
+    if requested_model is not None:
+        chosen = resolve_model_choice(models, requested_model)
+        if chosen is None:
+            raise ValueError(f"Модель «{requested_model}» недоступна.")
+    else:
+        chosen = select_model_from_catalog(models, current_model)
+    if not chosen:
+        raise ValueError("Codex не вернул доступных моделей.")
+
+    supported = supported_reasoning_efforts(chosen)
+    if requested_effort is not None:
+        effort = resolve_effort_choice(chosen, requested_effort)
+        if effort is None:
+            raise ValueError(
+                f"Мощность «{requested_effort}» недоступна для {model_key(chosen)}."
+            )
+    else:
+        effort = (current_effort if current_effort in supported else
+                  chosen.get("defaultReasoningEffort") or
+                  (supported[0] if supported else None))
+    return model_key(chosen), effort
 
 
 def render_model_picker(runtime):
@@ -1325,12 +1388,8 @@ def render_effort_picker(runtime):
         return "Codex не вернул доступных моделей."
     current = chat_state(runtime.state_key).get("effort")
     lines = [f"⚡ Мощность модели {chosen.get('displayName') or model_key(chosen)}:"]
-    for option in chosen.get("supportedReasoningEfforts", []):
-        if not isinstance(option, dict):
-            continue
-        effort = option.get("reasoningEffort")
-        if not effort:
-            continue
+    for option in effort_options(chosen):
+        effort = option["reasoningEffort"]
         description = option.get("description")
         line = f"{'●' if effort == current else '○'} {effort} — /effort {effort}"
         if description:
@@ -1769,6 +1828,8 @@ def external_request_watcher():
             text,
             resume_thread_id=request.get("resume_thread_id"),
             workspace=request.get("workspace"),
+            model=request.get("model"),
+            effort=request.get("effort"),
         )
 
 
@@ -1933,10 +1994,11 @@ def queue_message(runtime, inputs, media_paths=None):
 
 def _delegate_error(chat_id, message):
     send_plain(chat_id, message)
-    write_last_turn(chat_id, message, delegated=True)
+    write_last_turn(chat_id, message, delegated=True, ok=False)
 
 
-def start_delegate_turn(chat_id, text, resume_thread_id=None, workspace=None):
+def start_delegate_turn(chat_id, text, resume_thread_id=None, workspace=None,
+                        model=None, effort=None):
     """Start a delegated turn in the real chat's isolated delegate tenant."""
     chat_id = int(chat_id)
     runtime = get_delegate_tenant(chat_id)
@@ -1991,6 +2053,31 @@ def start_delegate_turn(chat_id, text, resume_thread_id=None, workspace=None):
         _delegate_error(chat_id, "Уже выполняю предыдущую делегированную задачу.")
         return False
 
+    requested_settings = None
+    if model is not None or effort is not None:
+        current_state = delegate_state if requested_thread_id else owner_state
+        try:
+            requested_settings = resolve_delegate_settings(
+                runtime,
+                current_model=current_state.get("model"),
+                current_effort=current_state.get("effort"),
+                requested_model=model,
+                requested_effort=effort,
+            )
+        except ValueError as exc:
+            with process_lock:
+                runtime.busy = False
+            _delegate_error(chat_id, str(exc))
+            return False
+        except Exception as exc:
+            with process_lock:
+                runtime.busy = False
+            _delegate_error(
+                chat_id,
+                f"Не удалось проверить настройки делегации: {compact(str(exc), 500)}",
+            )
+            return False
+
     updates = {"pending_delegator_session_id": owner_thread_id or ""}
     if requested_thread_id:
         # Keep the full persisted ID; the caller may pass the short prefix
@@ -2011,6 +2098,8 @@ def start_delegate_turn(chat_id, text, resume_thread_id=None, workspace=None):
             workspace=workspace or owner_state.get("workspace"),
         )
         thread_id = None
+    if requested_settings is not None:
+        updates["model"], updates["effort"] = requested_settings
     update_state(delegate_state_key, **updates)
 
     try:
@@ -2167,15 +2256,11 @@ def handle_command(chat_id, command, runtime=None):
             if not arg:
                 send_plain(chat_id, render_model_picker(runtime))
                 return True
-            chosen = next((model for model in models if arg.lower() in {
-                model_key(model).lower(), str(model.get("id") or "").lower(),
-                str(model.get("displayName") or "").lower(),
-            }), None)
+            chosen = resolve_model_choice(models, arg)
             if chosen is None:
                 send_plain(chat_id, f"Модель «{arg}» недоступна.\n\n{render_model_picker(runtime)}")
                 return True
-            supported = [option.get("reasoningEffort") for option in
-                         chosen.get("supportedReasoningEfforts", []) if isinstance(option, dict)]
+            supported = supported_reasoning_efforts(chosen)
             current_effort = chat_state(state_key).get("effort")
             effort = (current_effort if current_effort in supported else
                       chosen.get("defaultReasoningEffort") or (supported[0] if supported else None))
@@ -2192,13 +2277,10 @@ def handle_command(chat_id, command, runtime=None):
             if not chosen:
                 send_plain(chat_id, "Codex не вернул доступных моделей.")
                 return True
-            options = [option for option in chosen.get("supportedReasoningEfforts", [])
-                       if isinstance(option, dict) and option.get("reasoningEffort")]
             if not arg:
                 send_plain(chat_id, render_effort_picker(runtime))
                 return True
-            effort = next((option["reasoningEffort"] for option in options
-                           if option["reasoningEffort"].lower() == arg.lower()), None)
+            effort = resolve_effort_choice(chosen, arg)
             if effort is None:
                 send_plain(chat_id, f"Мощность «{arg}» недоступна для {model_key(chosen)}.\n\n"
                            f"{render_effort_picker(runtime)}")
